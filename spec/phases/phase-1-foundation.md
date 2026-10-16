@@ -23,3 +23,7 @@
 - [ ] 新库按 README 安装后 --help 可用；未实现命令明确提示，不产生假结果。
 
 证据：测试报告、示例 manifest、合成事件往返结果。通过后进入 Phase 2；协议变更必须更新契约和版本。
+
+## v0.3 集成补充（必做）
+
+在原仓库新增根目录 behavior_lab 纯核心包，保留 src 包和 run_gui.py。R17：定义 legacy/manual_record/model_shadow/model_control 四模式和输出后端注入接口，Mac 纯核心不导入 Windows 后端。验收模式配置及非法切换拒绝；不创建第二套游戏执行程序。

@@ -64,3 +64,11 @@ py -3.12 -m venv .venv
 ## 验收包
 
 交付 `artifacts/<run-id>/`：doctor、测试报告、性能报告、故障矩阵、运行 manifest、脱敏短片索引、已知问题。每项标明 passed/failed/not_run。Windows 首次真实采集、真实输出、拟真统计验证分别签收，不互相替代。
+
+## v0.3 原应用验收补充
+
+以原 run_gui.py 或现有启动脚本为用户入口，新增四模式按 [集成方案](autolevelup-integration.md) 验证。上述 behavior_lab CLI 仅为开发/训练/验收工具，共用同一输出适配器，不能实现第二套按键循环。
+
+先准备原角色/怪物模板和 F4 地图，再录真人演示。manual_record/model_shadow 不初始化真实输出后端，验证自动登录、回城、药水、Buff、拾取旁路全部关闭。model_control 使用原 Interception 后端，驱动安装/可用性检查以随仓库保留的上游说明为起点，需 Windows 实际验证，不在 Mac 安装。
+
+新增验收项：F4 旧资源兼容；真实键位映射正确；正常模型输出不被旧路线覆盖；tap 不因键盘线程刷新重复；显式时长无二次随机；模式切换先释放并取消 pending。驱动失败、释放失败及模型断线分别出具回执。模型卡住默认 STOP，人工切回 legacy 后才能继续规则策略。

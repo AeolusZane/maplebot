@@ -2,6 +2,8 @@
 
 ## 方案选择
 
+v0.3 应用基础为已导入的 AutoLevelUp，按 [集成方案](autolevelup-integration.md) 增量开发。KeyBoardController 继续拥有唯一按键线程，InterceptionController 继续承担真实发键；新增模块不自建第二套输入驱动或常驻控制线程。
+
 采用规则基线 → 真人配对采集 → 行为克隆动作模型的路线。模型直接预测允许键组合与更新间隔，不需要生成自然语言。首选候选为小型 GRU，比较单帧 MLP 基线；隐藏维度、历史窗口和更新周期通过验证数据与运行延迟决定，不能事先宣称最佳。半马尔可夫模型仅作为后续高层意图对照。
 
 本地和远端运行同一动作策略接口。Windows 本机只需承担感知、输入执行和时效控制；训练可放在另一台机器。CPU 推理是需测试的部署选项，不把 1GB 显存当作神经模型能够运行的证明。
@@ -15,8 +17,8 @@ flowchart TD
     C --> D[ActionProposal 按键组合与有效期]
     D --> E[本地约束与动作仲裁]
     B --> E
-    E --> F[动作调度器]
-    F --> G[Trace / 模拟器 / Windows 测试执行器]
+    E --> F[原 KeyBoardController 的结构化调度入口]
+    F --> G[Trace / 测试替身 / 原 InterceptionController]
     G --> H[Receipt 执行回执]
     H --> C
     B --> I[会话记录与评测]
@@ -26,18 +28,19 @@ flowchart TD
 
 感知负责“看到了什么”，模型负责“此刻建议按哪些键”，本地仲裁负责协议与硬约束，调度器负责按下和释放。正常动作不再被固定路线策略二次决定。规则基线可调用原导航；可选高层策略可把 Intent 作为动作模型附加输入。不得同时启用两套正常走位决策。执行回执只证明输出调用结果，不能证明游戏已接受动作；成功效果必须由下一次观察确认。
 
-## 推荐代码目录（待创建）
+## 增量代码目录（原应用保留，新增目录待创建）
 
 ```text
 pyproject.toml
-src/behavior_lab/
+src/                        # 保留 engine、input、ui、utils、states
+behavior_lab/               # 仓库根纯核心包，避免与原 src 包布局冲突
   cli.py
   core/                 # contracts、clock、rng、validation
   policies/             # deterministic、timing_jitter、behavior_clone、replay
   learning/             # dataset、causal_features、train、export、model_manifest
   navigation/           # 区域/连接、现有路线适配器
   runtime/              # observation_store、arbiter、scheduler、watchdog
-  adapters/windows/     # capture、input_recorder、test_sink、target_adapter
+  adapters/windows/     # 原感知/键盘控制器桥接、演示监听；不重写驱动
   recording/            # writer、manifest、sync、annotation、replay
   simulation/           # 固定地图、怪物和事件、观察限制
   evaluation/           # split、features、metrics、report
@@ -49,6 +52,8 @@ spec/
 ```
 
 核心只依赖标准库及必要的数值计算库；捕获、UI、Windows API 为可选依赖，延迟导入。运行基线选 Python 3.12；依赖在 Phase 1/2 实装时验证并锁定，不能把当前未锁版本直接当作复现环境。
+
+原 run_gui.py 是用户运行入口；behavior_lab CLI 用于训练、回放、评测和测试。图中的“调度器”部署在原 KeyBoardController 内或由它调用的纯调度核心中，始终只有一个输出所有者。requirements.txt 维持原应用依赖，学习依赖单独提供，安装行为模型不强制执行机安装训练框架。
 
 ## 可选高层状态模型（不阻塞动作模型交付）
 

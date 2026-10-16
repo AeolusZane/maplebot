@@ -20,3 +20,9 @@
 - [ ] 时间扰动不产生非法键组合或突破硬冷却。
 
 证据：闭环模拟报告、故障测试、基线配置摘要。范围外：Windows 真实输入、真人拟真结论。
+
+## v0.3 执行复用与验收（R17、R18）
+
+原 KeyBoardController 接入结构化动作，保持唯一输出线程。真实后端复用 InterceptionController，测试使用 spy/Trace。将 update_cmd_by_mob_detection 的识别与攻击决策分离，模型复用感知而不调用旧决策。legacy 保留原路线行为并记录适配差异。
+
+验收：原键位配置正确映射；相同 held 状态不重复 key_down；tap 去重；四模式动作来源互斥，切换取消 pending、释放并更新 epoch。最小合成场景与录制帧足够做初期测试，完整地图物理仿真不作为首次录制前置。

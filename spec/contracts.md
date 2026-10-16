@@ -20,6 +20,8 @@
 
 ## ActionProposal（主策略输出）
 
+动作键为语义键，通过 AutoLevelUp 当前配置映射到 Interception 的实际键名。映射与 action_schema 一并冻结；方向键直接对应，jump/attack 等由配置确定。所有执行均经原 KeyBoardController，底层显式使用提案的持续时间，不追加独立随机延迟。原配置冲突、未知键名需拒绝并报告。
+
 `proposal_id, session_id, request_id, policy_epoch, model_version, based_on_frame_id, held_keys, tap_events, valid_for_ns, next_update_after_ns`。
 
 held_keys 为完整期望集合，空集合代表释放所有持续键；tap_events 每项包含稳定 event_id、允许键和 bounded hold_duration_ns。同一未完成 tap 不能每帧生成新 ID；训练侧从按下边沿构建事件，连续保持攻击键不得转换成无数新点击。键行为由 action_schema 配置声明，键不能同时出现在 held 和 tap；不允许左+右、上+下等矛盾集合。
@@ -80,6 +82,8 @@ data/sessions/<session_id>/
 ```
 
 manifest 包含硬件/OS、程序 commit、依赖锁摘要、窗口/分辨率/DPI、地图/职业配置、允许键、数据来源 human/synthetic/bot、匿名参与者 ID、种子、录制完整性、文件摘要。写入采用临时文件到原子完成标记；异常中断的会话标记 incomplete，可修复但不能默认为完整。
+
+另记录运行模式 legacy/manual_record/model_shadow/model_control、语义键到物理键映射、辅助药水/Buff/拾取是否启用、动作 source、上游版本。manual_record 必须证实自动输出关闭；混合自动操作的会话不能标成纯真人演示。
 
 frame_index 记录实际捕获时间、帧 ID、视频段/帧映射和丢帧标记；不能靠“帧号÷目标 FPS”重建真实时间。annotation 包含起止时间、标签、标注者、来源、可信度；unknown 为合法标签。
 
