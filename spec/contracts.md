@@ -96,3 +96,7 @@ frame_index 记录实际捕获时间、帧 ID、视频段/帧映射和丢帧标�
 样本包含 `sample_id/session_id/decision_t_ns/history/action_label/label_window/quality_mask`。history 中每个观察的 produced_t_ns 必须不晚于 decision_t_ns。离线补算视觉时记录 offline 来源与处理延迟假设，不得默认在捕获瞬间已得到识别结果。截断的按键持续时间标记右删失，未来按键只作为标签，不能进入输入特征。
 
 model manifest 包含训练 split 摘要、权重摘要、特征版本、action_schema、归一化参数、历史长度、状态重置规则、采样/解码模式、时长限额及运行依赖。运行时任一版本不匹配拒绝加载。位级重现只要求固定受支持运行环境；不同硬件以输出数值容差和动作一致性报告，不承诺所有神经运行时逐位一致。
+
+## v0.4 验证产物
+
+Receipt 增加 backend、simulated 和 verification_run_id，Trace 完成不得标为真实输出。验证事件关联 scenario_id 和 assertion_id；每个报告记录完整版本摘要、必测结果、not_run 项及失败事件索引。gates.json 只关联实际产物哈希，不作为永久通行证。模型/配置/执行逻辑变化后对应证据失效；规则详见 [离线规格](offline-validation.md)。

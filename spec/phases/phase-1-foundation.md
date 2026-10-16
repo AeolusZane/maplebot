@@ -27,3 +27,7 @@
 ## v0.3 集成补充（必做）
 
 在原仓库新增根目录 behavior_lab 纯核心包，保留 src 包和 run_gui.py。R17：定义 legacy/manual_record/model_shadow/model_control 四模式和输出后端注入接口，Mac 纯核心不导入 Windows 后端。验收模式配置及非法切换拒绝；不创建第二套游戏执行程序。
+
+## v0.4 离线门槛 G0（R19、R21）
+
+实现 backend 注入、虚拟时钟和 events/report schema。离线构造路径禁止初始化驱动、查找/激活窗口和发键点击，使用抛异常哨兵验收。Trace 回执必须标 simulated。无游戏、无 Windows 模块的 Mac/Windows 核心测试能运行；日志缺失不填零，not_run 不算通过。规则见 [离线规格](../offline-validation.md)。

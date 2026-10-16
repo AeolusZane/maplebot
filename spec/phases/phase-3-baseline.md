@@ -26,3 +26,7 @@
 原 KeyBoardController 接入结构化动作，保持唯一输出线程。真实后端复用 InterceptionController，测试使用 spy/Trace。将 update_cmd_by_mob_detection 的识别与攻击决策分离，模型复用感知而不调用旧决策。legacy 保留原路线行为并记录适配差异。
 
 验收：原键位配置正确映射；相同 held 状态不重复 key_down；tap 去重；四模式动作来源互斥，切换取消 pending、释放并更新 epoch。最小合成场景与录制帧足够做初期测试，完整地图物理仿真不作为首次录制前置。
+
+## v0.4 日志断言与模拟闭环 G1/G2（R19–R21）
+
+按 [离线规格](../offline-validation.md) 实现 O01–O13 的可控场景、自动断言、失败事件索引和 verify CLI。规则策略用 golden trace，模拟动作真实改变模拟位置/目标状态；不能只播放固定截图充当闭环。必测包括持有/释放、重复 tap、观测过期、异常、模式切换、平台/梯子和网络 stub 故障。输出 report.json、report.md、events.jsonl 与版本摘要，必测全通过才签收。

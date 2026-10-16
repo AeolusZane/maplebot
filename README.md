@@ -1,6 +1,6 @@
 # Maplebot：AutoLevelUp 源码与行为模型开发方案
 
-状态：已在本地导入 AutoLevelUp 上游源码与历史；v0.3 方案明确复用原 Interception 执行层，行为模型尚未实现，Windows 实机验证尚未进行。
+状态：已在本地导入 AutoLevelUp 上游源码与历史；v0.4 方案复用原 Interception 并强制离线优先验证，行为模型尚未实现，Windows 实机验证尚未进行。
 
 ## 上游来源与运行入口
 
@@ -17,6 +17,8 @@
 本仓库已包含上游跟踪的源码和资源，文档使用相对链接，不依赖当前 Mac 路径。个人配置、真人数据、构建产物和凭据不应提交。
 
 ## 阅读顺序
+
+新增必读：[离线优先验证 v0.4](spec/offline-validation.md)，明确不开游戏的日志断言、模拟闭环、自建窗口测试，以及最后的游戏验证门槛。
 
 优先阅读 [AutoLevelUp 集成方案 v0.3](spec/autolevelup-integration.md)：保留原 UI、感知、F4 和 Interception，新增演示录制及模型动作决策，明确四种模式的输出边界。
 
