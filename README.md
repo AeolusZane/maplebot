@@ -1,10 +1,20 @@
-# 行为生成与检测评测实验项目
+# Maplebot：AutoLevelUp 源码与行为模型开发方案
 
-状态：方案文档已编写，程序尚未实现，Windows 实机验证尚未进行。
+状态：已导入 AutoLevelUp 上游源码与历史；我们的 v0.2 行为模型方案尚未实现，Windows 实机验证尚未进行。
+
+## 上游来源与运行入口
+
+基于 [Aynamuk/MapleStoryAutoLevelUp-CN](https://github.com/Aynamuk/MapleStoryAutoLevelUp-CN)，导入基准为 `94b1d9e44f885b311301c73a46df43a8cff035ec`，保留上游 Git 历史和 [MIT 许可证及署名](LICENSE)。这是现有独立仓库的源码合并，GitHub 页面不一定显示 Fork 关系。
+
+- [上游开发与安装说明](README_UPSTREAM.md)
+- [上游用户说明](README_用户版.md)
+- 现有入口：`run_gui.py`、`src/`、`tools/`、`requirements.txt`。
+- `spec/` 中的 `behavior_lab` 是待开发架构，不是现有源码已提供的命令。
+- 上游 CI 仍按原配置监听 `master`，本仓库主分支为 `main`；本次导入不代表 CI 或 Windows 测试已通过，后续实现时再适配工作流及其历史标签依赖。
 
 目标：建立实时“环境状态 → 模型按键提案 → 本机执行 → 环境反馈”闭环。先用规则基线跑通，再用真人配对数据训练小型行为克隆动作模型；支持本地 CPU 或局域网另一台机器推理。Windows 负责采集和实测，Mac 可开发与运行离线测试。当前规格为 v0.2。
 
-本目录可以整体复制为新代码库的初始内容。文档使用相对链接，不依赖当前 Mac 路径。不要把研究目录中的完整第三方仓库或真人数据直接一起提交。
+本仓库已包含上游跟踪的源码和资源，文档使用相对链接，不依赖当前 Mac 路径。个人配置、真人数据、构建产物和凭据不应提交。
 
 ## 阅读顺序
 
