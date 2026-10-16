@@ -31,10 +31,11 @@ py -3.12 -m venv .venv
 2. **测试窗口采集**：`python -m behavior_lab record --config configs/recording.yaml`。先打开项目交付的可视反馈测试窗口，短按/长按/组合键/切换焦点/停止录制，回放核对。
 3. **检查会话**：`python -m behavior_lab validate-session --session data/sessions/<session-id>`；无完整性错误才能进入拟合。
 4. **回放与标注**：`python -m behavior_lab replay --session data/sessions/<session-id>`；显示画面、输入和时间轴，人工标注写独立文件，不能改原始事件。
-5. **生成器**：`python -m behavior_lab simulate --scenario fixtures/synthetic/platform.json --policy semi-markov --seed 42 --output artifacts/generator`；检查中断、非法动作、状态驻留。
+5. **训练与生成器**：`python -m behavior_lab train --config configs/training.yaml --output artifacts/model`，然后 `python -m behavior_lab simulate --scenario fixtures/synthetic/platform.json --policy behavior-clone --model artifacts/model --seed 42 --output artifacts/generator`。训练可在另一台机器完成；模型包包含特征/动作版本与 manifest，数据不足时模型阶段不能标完成。
 6. **评测**：`python -m behavior_lab evaluate --config configs/evaluation.yaml --output artifacts/evaluation`。数据不足也生成报告，但不能返回“研究结论通过”。
 7. **Windows shadow**：`python -m behavior_lab run --config configs/windows.yaml --mode shadow`；观察真实画面和生成意图，sink 为 trace，验证无真实输出。
 8. **受控执行**：`python -m behavior_lab run --config configs/windows-test.yaml --mode execute`；先只向项目测试窗口执行，再按适配器验证清单接入授权目标环境。
+9. **两机推理**：模型机运行 `python -m behavior_lab serve --config configs/server.yaml --model artifacts/model`；Windows 运行 `python -m behavior_lab run --config configs/windows-remote.yaml --mode shadow`，再在测试窗口验证 execute。配置私网地址、认证凭据引用和期限，不在命令行打印凭据。测试乱序、重复 tap、断网及隐藏状态重置。
 
 以上 python 表示 `.venv\Scripts\python.exe`，占位 session-id 替换为录制器实际输出。CLI 返回码：0=命令级检查通过，1=验证失败，2=配置/依赖错误；研究证据是否充分另写 report.conclusion，不能由退出码替代。
 
@@ -50,7 +51,7 @@ py -3.12 -m venv .venv
 | 录制队列满/磁盘不足 | 明确错误/缺失，不输出完整成功标记 | quality、manifest |
 | 停止时仍按住方向 | 受控键释放；失败则明确告警 | held_keys_after |
 | 分辨率/DPI变化 | 观察失效并要求重新校准 | doctor/运行事件 |
-| 可选网络断线/乱序 | 旧响应丢弃，停止，重连不自动恢复 | request/epoch 日志 |
+| 网络断线/乱序 | 旧响应丢弃，停止，重连不自动恢复 | request/epoch 日志 |
 
 ## 性能测量与初始预算
 

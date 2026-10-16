@@ -10,6 +10,7 @@
 
 - 创建 pyproject、src 布局、开发锁文件、平台可选依赖与 CLI --help。
 - 实现 contracts 中的类型、JSONL 编解码与版本检查；注入 Clock、RNG。
+- 实现 ActionProposal、action_schema 和模型包版本契约；测试合法多键组合、空集合释放、矛盾键拒绝和重复 tap 去重。
 - 实现 TraceSink、模拟时钟、基本 manifest 与数据目录规则。
 - 提供 .gitignore：data/、artifacts/、凭据与本地配置不进库；fixtures 仅包含人工合成数据。
 - 测试核心在没有 pywin32/输入驱动时可导入；配置清晰区分录制、shadow、execute。
