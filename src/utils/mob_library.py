@@ -115,6 +115,19 @@ def _to_template(img):
     return None
 
 
+def available_index(root=None, library_root=None):
+    """Unified catalog: packaged artwork plus live F3 captures, without conversion."""
+    index={name:dict(entry) for name,entry in load_index(library_root).items()}
+    base=os.path.join(root or REPO_ROOT,'monster')
+    for name in sorted(installed_mobs(root)):
+        files=sorted(glob.glob(os.path.join(base,name,f'{name}*.png')))
+        if not files:continue
+        entry=index.setdefault(name,{'level':'','id':''})
+        entry['local_frames']=len(files)
+        entry['local_only']=not bool(mob_files(entry))
+    return index
+
+
 def installed_mobs(root=None):
     """monster/ 下已装好的怪名集合。"""
     base = os.path.join(root or REPO_ROOT, 'monster')
@@ -157,6 +170,9 @@ def install(name, root=None, overwrite=False):
     已存在且 overwrite=False 时不动（用户自己截的模板优先级更高，不能被覆盖）。
     """
     root = root or REPO_ROOT
+    dst_dir = os.path.join(root, 'monster', name)
+    if not overwrite and glob.glob(os.path.join(dst_dir, f'{name}*.png')):
+        return 'exists'
     idx = load_index()
     ent = idx.get(name)
     if not ent:

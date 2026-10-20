@@ -70,14 +70,12 @@ class AutoBotController(QObject):
         Only called after UI init
         '''
         self.debug_image_signal.connect(ui.update_debug_canvas)
-        self.route_map_viz_signal.connect(ui.update_route_map_canvas)
         # Register Function Key handler
         # F1~F4 全部走 Qt 信号回主线程（游戏窗口聚焦时也能触发主界面功能；
         # F4 录路线要弹 Qt 输入框，绝不能在 pynput 线程直接操作 Qt 控件）
         self.kb_listener.register_func_key_handler('f1', ui.hotkey_f1.emit)
         self.kb_listener.register_func_key_handler('f2', ui.hotkey_f2.emit)
         self.kb_listener.register_func_key_handler('f3', ui.hotkey_f3.emit)
-        self.kb_listener.register_func_key_handler('f4', ui.hotkey_f4.emit)
         # F2/F3/F4 现在是「标定名字 / 截怪物模板 / 录路线」—— 点主界面按钮触发，
         # 不注册游戏内热键：录路线要弹地图ID输入框，必须走 Qt 主线程，
         # 从 pynput 线程弹 Qt 对话框会崩。
@@ -94,6 +92,8 @@ class AutoBotController(QObject):
         #    → KeyError → 主循环线程**静默死亡** → 症状「点开始、角色不动、
         #    日志里啥都没有」，查了一整天。铺底之后任何局部配置都能安全跑
         #    （终端入口 main() 本来就是这么做的，只有界面这条路径漏了）。
+        if getattr(self, 'manual_capture_active', False):
+            return -1
         cfg = override_cfg(load_yaml("config/config_default.yaml"),
                            load_yaml(cfg_path))
 
@@ -152,7 +152,7 @@ class AutoBotController(QObject):
         # ⇒ 在这里拦下，把「哪张图、为什么废、怎么修」直接讲清楚，而不是启动后装死。
         #   （判据用 img_routes 是否为空：所有判废分支都走 `continue`，
         #     不会进这个列表，见 MapleStoryAutoLevelUp 加载路线那段。）
-        if not getattr(self.auto_bot, "img_routes", None):
+        if not getattr(self.auto_bot, "img_routes", None) and self.auto_bot.graph_navigator is None:
             self.no_route_problem = True
             _map = (cfg.get("bot", {}) or {}).get("map", "") or "<未选择>"
             logger.error(
@@ -161,7 +161,7 @@ class AutoBotController(QObject):
                 f"        常见原因：这条路线判废了（没有终点 goal 标记 / 没录到路线 / "
                 f"去程回程叠在一段）。\n"
                 f"        上面的日志里有 [路线校验] 打出的**具体原因**，照着修即可。\n"
-                f"        怎么补：主界面按 F4 重录这张图 —— 一路走到终点按 F3 保存"
+                f"        怎么补：点击【检查并修正地图】，确认平台与连接并启用地图导航"
                 f"（收尾会自动盖上 goal 标记）。")
             return -3   # 与"驱动不可用(-2)"区分开，界面据此弹"没有可用路线"
 

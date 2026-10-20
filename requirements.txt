@@ -14,3 +14,4 @@ pygetwindow
 pywin32
 windows-capture
 interception-python
+rapidocr_onnxruntime==1.4.4

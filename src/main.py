@@ -3,6 +3,7 @@ import sys
 
 # Pyside
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
 
 # Load Import
 from src.ui.ui import MainWindow
@@ -40,6 +41,9 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--tool":
         sys.exit(_run_tool(sys.argv[2:]))
 
+    review_map = '--review-map' in sys.argv
+    if review_map:
+        sys.argv.remove('--review-map')
     app = QApplication(sys.argv)
 
     autoBotController = AutoBotController()
@@ -48,6 +52,8 @@ def main():
     autoBotController.update_signal(ui)
 
     ui.show()
+    if review_map:
+        QTimer.singleShot(0, ui._open_map_graph_editor)
 
     sys.exit(app.exec())
 

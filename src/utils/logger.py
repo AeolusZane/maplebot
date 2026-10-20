@@ -3,6 +3,7 @@ Global Logger
 '''
 # Standard Import
 import logging
+from logging.handlers import RotatingFileHandler
 import datetime
 import os
 
@@ -29,11 +30,15 @@ class MSLogger:
 
         # 日志目录同样走统一路径解析（打包后落在 exe 旁边，而非不确定的 CWD）
         log_dir = ensure_dir("log")
-        file_handler = logging.FileHandler(
-            os.path.join(log_dir, f"{name}_{now_str}.log"), mode='w', encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            os.path.join(log_dir, f"{name}_{now_str}.log"),
+            maxBytes=10*1024*1024, backupCount=3, encoding="utf-8")
         file_handler.setFormatter(formatter)
 
-        console_handler = logging.StreamHandler()
+        # Redirected launcher stderr must not become an unbounded duplicate log.
+        import sys
+        console_handler = (logging.StreamHandler() if sys.stderr and sys.stderr.isatty()
+                           else logging.NullHandler())
         console_handler.setFormatter(formatter)
 
         self._logger.addHandler(file_handler)

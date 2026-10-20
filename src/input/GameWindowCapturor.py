@@ -78,6 +78,7 @@ class GameWindowCapturor:
     def __init__(self, cfg, test_image_name = None, window_title = None):
         self.cfg = cfg
         self.frame = None
+        self.frame_time = 0.0
         self.lock = threading.Lock()
         self.fps = 0
         self.fps_limit = cfg["system"]["fps_limit_window_capturor"]
@@ -228,6 +229,7 @@ class GameWindowCapturor:
         '''
         with self.lock:
             self.frame = frame.frame_buffer
+            self.frame_time = time.monotonic()
         self.limit_fps()
 
     def on_closed(self):
@@ -245,6 +247,12 @@ class GameWindowCapturor:
             if self.frame is None:
                 return None
             return cv2.cvtColor(self.frame, cv2.COLOR_BGRA2BGR)
+
+    def get_frame_with_timestamp(self):
+        """Read pixels and source timestamp from the same capture snapshot."""
+        with self.lock:
+            return (None if self.frame is None else cv2.cvtColor(self.frame, cv2.COLOR_BGRA2BGR),
+                    self.frame_time)
 
     def stop(self):
         '''

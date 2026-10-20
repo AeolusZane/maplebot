@@ -1,3 +1,4 @@
+from src.utils.attack_geometry import vertical_reach
 '''
 UI main
 '''
@@ -11,6 +12,7 @@ import ctypes
 import logging
 import subprocess
 import time
+import numpy as np
 
 # PySide 6
 from PySide6.QtWidgets import (
@@ -39,7 +41,7 @@ TAB_WINDOW_SIZE = {
     '主界面': (700, 800),
     '高级设置': (750, 800),
     '游戏画面': (1502, 844),
-    '路线地图': (800, 800),
+    '地图调试': (1280, 850),
     '工具箱': (800, 860),
 }
 
@@ -667,7 +669,6 @@ class MainWindow(QMainWindow):
     hotkey_f1 = Signal()
     hotkey_f2 = Signal()
     hotkey_f3 = Signal()
-    hotkey_f4 = Signal()
 
     # 录制器多久没输出就判定它已死（秒）—— 见 _recorder_alive 的说明。
     # 取 20s 的理由：录制器正常时至少每几秒会有一行日志（抓帧/存段/体检），
@@ -709,14 +710,19 @@ class MainWindow(QMainWindow):
         self.advance_settings_gboxes = {}
         self.tab_main = self.setup_main_tab()
         self.tab_game_window_viz = self.setup_game_window_viz_tab()
-        self.tab_route_map_viz = self.setup_route_map_viz_tab()
         self.tab_toolbox = self.setup_toolbox_tab()
 
         # Add tabs to tab widget
         self.tabs.addTab(self.tab_main, "主界面")
         self.tabs.addTab(self.tab_game_window_viz, "游戏画面")
-        self.tabs.addTab(self.tab_route_map_viz, "路线地图")
         self.tabs.addTab(self.tab_toolbox, "工具箱")
+        from src.ui.map_debug import MapDebug
+        self.tab_map_debug=MapDebug(lambda:self.controller.auto_bot,lambda:getattr(self,'selected_map',None) or self.cfg.get('bot',{}).get('map',''),self._debug_edit_map)
+        self.tabs.addTab(self.tab_map_debug,'地图调试')
+        from src.ui.statistics_tab import StatisticsTab
+        self.tab_statistics=StatisticsTab(lambda:self.controller.auto_bot)
+        self.tabs.addTab(self.tab_statistics,'数据统计')
+        self.tab_statistics.history_changed.connect(self.tab_map_debug.experience_charts.reload)
 
         # Change tabs signals
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -727,6 +733,9 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+
+        from src.ui.workspace_shell import install
+        install(self)
 
         # Load previous stored UI state
         self.load_ui_state()
@@ -790,7 +799,6 @@ class MainWindow(QMainWindow):
         self.hotkey_f1.connect(self._hotkey_f1_guarded)
         self.hotkey_f2.connect(self._hotkey_f2_guarded)
         self.hotkey_f3.connect(self._hotkey_f3_guarded)
-        self.hotkey_f4.connect(self._hotkey_f4_guarded)
         # ── 录制器"存活兜底"两个时间戳（见 _recorder_alive，2026-09-27 加）──
         # _recorder_started_t / _recorder_last_output_t：前者在启动录制器时置位，
         # 后者每次收到录制器输出时刷新；两者都超过 _RECORDER_STALE_SEC 秒没有任何
@@ -835,6 +843,7 @@ class MainWindow(QMainWindow):
         current = [(self.list_widget_maps.item(i).text(),
                     self.list_widget_maps.item(i).data(Qt.UserRole))
                    for i in range(self.list_widget_maps.count())]
+        self.refresh_map_config_summary()
         if new_items == current:
             return False
         self.list_widget_maps.clear()
@@ -956,19 +965,6 @@ class MainWindow(QMainWindow):
 
         return tab_game_window_viz
 
-    def setup_route_map_viz_tab(self):
-        tab_route_map_viz_tab = QWidget()
-        layout = QVBoxLayout()
-        tab_route_map_viz_tab.setLayout(layout)
-
-        # Create a large QLabel as a canvas
-        self.route_map_canvas = QLabel()
-        clear_debug_canvas(self.route_map_canvas)
-        self.route_map_canvas.setStyleSheet("background-color: black; color: white;")
-        layout.addWidget(self.route_map_canvas)
-
-        return tab_route_map_viz_tab
-
     # ------------------------------------------------------------------
     # 工具箱页签（2026-09-12）：只放「验证 / 登记 / 诊断」三类辅助功能。
     # 资源制作三连（标定名字 / 截怪物模板 / 录路线）在主界面 F2/F3/F4。
@@ -1081,144 +1077,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         tab_toolbox.setLayout(layout)
 
-        tip = QLabel(
-            "资源制作三连（标名字 / 截怪 / 录路线）在主界面 F2 / F3 / F4。\n"
-            "先是完整流程教程，再往下是体检与诊断 —— 平时挂机哪都不用点。")
+        tip = QLabel('诊断和模板维护已移至设置；采集与录像位于记录。')
         tip.setWordWrap(True)
         layout.addWidget(tip)
-
-        # ---- 教程（2026-09-17 重写）----------------------------------------
-        # ⚠️ 旧教程写的是「去程按 F3、回程再按 F3，两段才能循环」——**错的**：
-        #    录制器里 F3 = 「存这段（存成 route{N}.png）」，**F8 才是折返分段**。
-        #    照旧教程做，用户会在去程终点就存盘，录出一条只有一段的线（不会往返）。
-        #    现在改成以**面板按钮**为主（录制面板 2026-09-15 重写过，按钮名就是步骤），
-        #    快捷键只在括号里注明，不再当主要指引。
-        # ------------------------------------------------------------------
-        gbox_guide = QGroupBox("换一张新图挂机 —— 照着做 5 步")
-        glay = QVBoxLayout(gbox_guide)
-        # ⚠️ 2026-09-26 重排步骤顺序（旧版把 F3 截怪放在 F4 录路线之前 —— **错的**）。
-        #    原因：F3 在代码里有硬前置 `if not self.selected_map: return`（见
-        #    launch_template_capture），必须先选中地图才能截怪；而地图是 F4 录路线
-        #    时才创建并登记到 config_data.yaml 的。出厂 config_data.yaml 是空表
-        #    （eng_to_cn: {} / map_mobs_mapping: {}），所以新用户照旧顺序做，会在
-        #    第 ② 步撞上「请先选地图」且列表全空 —— 卡死且不知道去哪弄地图。
-        #    ⇒ 正确顺序：标名字 → 录路线(产生地图) → 选地图 → 截怪 → 开始。
-        guide = QLabel(
-            "<b>① F2 标定名字</b>　<font color=gray>只有换角色才要做</font><br>"
-            "　先在弹出的输入框里填你角色的名字（和游戏里一模一样），点确定；<br>"
-            "　然后在游戏画面上<b>框住角色的名字行</b>，再<b>点一下角色中心</b>。"
-            "不标的话角色定位会失效。<br><br>"
-
-            "<b>② F4 录挂机路线</b>　<font color=gray>要管理员运行本程序，"
-            "否则收不到游戏里的按键</font><br>"
-            "　<b>这一步会创建地图</b> —— 新图必须先录路线，地图列表里才会有它。<br>"
-            "　弹出来的录制面板，<b>全程用鼠标点按钮</b>就够了：<br>"
-            "　· 站到想当起点的位置 → 点【开始录（我站好了）】<br>"
-            "　· 一路走到平台另一头 → 点【在这折返，存下这段】<br>"
-            "　· 再走回起点附近 → 点【这是终点，保存这段】<br>"
-            "　· 点【主线录完了，下一步】<br>"
-            "　⚠️ <b>去程和回程必须分成两段</b>：挤在同一段的话，同一个位置既有向左"
-            "又有向右的路线像素，角色会一路冲出平台。<br><br>"
-
-            "<b>③ 选地图</b><br>"
-            "　录完路线关闭界面、重新打开，地图就会出现在下方列表里 —— 点选它。"
-            "（路线会自动登记，不用手动加。）<br><br>"
-
-            "<b>④ F3 截怪物模板</b>　<font color=gray>换图才做，"
-            "且必须在选好地图之后</font><br>"
-            "　框住一只怪自动抠图。<b>一只怪通常 2 个模板就够</b> —— 挑姿态差别大的"
-            "两种截（比如站立 / 攻击），<b>相似的就别重复截了</b>。<br>"
-            "　· 游戏是横版，怪只有左右两个朝向，而引擎会<b>自动把每张模板左右镜像</b>，"
-            "所以一张顶两张用，不用自己截反面。<br>"
-            "　· 感觉<b>识别不稳</b>（漏怪 / 打空）就多截几个姿态；<br>"
-            "　· 感觉<b>帧率变低</b>（模板越多每帧匹配越慢）就去下面「模板查重」清一遍。<br>"
-            "　<b>以前截过的怪直接复用</b> —— 主界面选中地图 →「🐾 打哪几种怪」勾上就行，"
-            "不用重截。<br><br>"
-
-            "<b>⑤ ▶ 开始 (F1)</b>　<font color=gray>建议先画回正线再挂机</font><br>"
-            "　路线和怪物都会<b>自动登记</b>。<br><br>"
-
-            "<b>🖊 手绘回正线</b>　<font color=gray>「掉下去能自己走回来」的关键，"
-            "强烈建议做</font><br>"
-            "　回正线 = 掉出平台后怎么走回主线。选好地图后随时可做。<br>"
-            "　推荐：主界面选中地图 → 点【🖊 手绘回正线】—— <b>不用开游戏、"
-            "不用真的掉一次</b>，在小地图上先点落点、再点回到主线的路就行。<br>"
-            "　也可以在录制时现场录：【录回正线】→ 自己走到坑里 →【我在落地点】"
-            "→ 走回主线 →【已回到主线】。<br>"
-            "　一张图可以有好几条 —— 有几个会掉的坑就画几条。<br><br>"
-
-            "<b>出问题怎么办</b><br>"
-            "· <b>按 F2/F3/F4 没反应</b>：多半是没以管理员身份运行 —— 关掉程序，"
-            "右键「启动界面.bat」→ 以管理员身份运行。<br>"
-            "· <b>掉下去回不来</b>：多半是没画回正线，或落点画错了 —— "
-            "用【🖊 手绘回正线】补一条。<br>"
-            "· <b>挂机变卡 / 帧率低</b>：下面「模板查重」看一眼，删掉重复的模板是"
-            "零损失的。<br>"
-            "· <b>角色不动 / 乱走 / 按键没反应</b>：点下面「保存诊断包」，"
-            "把弹出的整个目录发给 AI。")
-        guide.setWordWrap(True)
-        guide.setTextFormat(Qt.RichText)
-        glay.addWidget(guide)
-        layout.addWidget(gbox_guide)
-
-        # ---- 核对（2026-09-15 **撤掉**，别再装回来）----------------------
-        # 这里原来有三个按钮：核对1 验证名字定位 / 核对2 验证定位轨迹 / 核对3 验证怪物模板。
-        # 撤掉的理由（用户 2026-09-15 裁定）：
-        #   ① 三者输出的都是**技术报告**（score 最小/中位/最大、分离度倍数、离阈值还剩多少），
-        #      终端用户看了也不知道该怎么办；
-        #   ② 三者都要求先有 debug/capture_raw_*.png 抓帧，而本页**没有抓帧按钮**
-        #      → 用户点下去只会看到「没有可用的抓帧」，然后无从下手；
-        #   ③ verify_nametag 自己还写着「未命中的帧……**请自行核对**」—— 最后一步判断它给不了。
-        # ⇒ 改为：出问题一律走「保存诊断包」。包里已带**游戏画面 + 名字/怪物模板**
-        #   （tools/diagnose.py，2026-09-15 同日升级），收件人用同一批 tools/ 离线复查。
-        #   ⚠️ tools/verify_nametag.py / verify_nametag_track.py / verify_monster.py **保留**
-        #      （开发者侧工具，只是不再给终端用户当按钮）。
-        # ------------------------------------------------------------------
-
-        # ---- 模板体检（2026-09-15）----
-        # 引擎对**每张** PNG 都会生成「原图 + 左右镜像」两个模板，所以
-        # 每次怪检测的匹配次数 = 张数 × 2 —— 多一张模板就是每次检测多跑两次
-        # 全 ROI 的 matchTemplate。而"多出来的"往往只是同一个姿势重截了一遍。
-        gbox_tpl = QGroupBox("模板体检（挂机卡了/识别不稳时可查）")
-        tpl_layout = QVBoxLayout(gbox_tpl)
-        # 2026-09-26 补说明：原先只说「多得会变慢」，没讲清「一张顶两张」这个
-        # 关键前提，用户容易重复截同一个姿态（纯浪费，还拖慢每帧检测）。
-        tpl_tip = QLabel(
-            "<font color=gray>"
-            "引擎加载每张模板时会<b>自动左右镜像</b>，所以每张实际参与 <b>2 次</b>匹配"
-            "（怪朝左朝右都能认）。一只怪一般 <b>2 个姿态差异较大的模板</b>就够了；"
-            "感觉识别不稳就多截几个，感觉卡顿就去下面清一遍重复的。"
-            "</font>")
-        tpl_tip.setWordWrap(True)
-        tpl_layout.addWidget(tpl_tip)
-        btn_tpl = QPushButton(
-            "模板查重 —— 列出相似度过高的模板（只报告不删，删哪张你定）")
-        btn_tpl.clicked.connect(self._launch_mob_template_qa)
-        tpl_layout.addWidget(btn_tpl)
-        layout.addWidget(gbox_tpl)
-
-        # ---- 诊断 ----
-        gbox_diag = QGroupBox("诊断（挂机出问题时用）")
-        diag_layout = QVBoxLayout(gbox_diag)
-        btn_diag = QPushButton(
-            "保存诊断包 —— 一键收集：报错日志 / 配置 / 游戏画面 3 张 / 名字与怪物模板，\n"
-            "整个目录发给 AI 排查")
-        btn_diag.clicked.connect(self._launch_diagnose)
-        diag_layout.addWidget(btn_diag)
-        # ★ 2026-09-28 加：**不含画面**的诊断包。
-        #   为什么需要：诊断包默认会把**游戏画面**收进去，而画面里有角色名 ——
-        #   有些用户不愿意把自己的角色名/画面发出来（issue #6 那位明确说了
-        #   「无法提供涉及角色名的截图」）。原来只能靠
-        #   `python -m tools.diagnose --frames 0` 这种命令行做法，但**普通用户
-        #   不会敲命令**（也不该为了反馈问题去学命令行）⇒ 给一个按钮。
-        #   ⚠️ 代价写在按钮上：没有画面，收件人只能靠模板推断"名牌有没有被挡住"，
-        #      定位会慢一些 —— 让用户自己权衡，不替他决定。
-        btn_diag_nopic = QPushButton(
-            "保存诊断包（不含游戏画面）—— 只收日志 / 配置 / 模板\n"
-            "适合不方便把游戏画面发出来的情况（定位会慢一些）")
-        btn_diag_nopic.clicked.connect(self._launch_diagnose_nopic)
-        diag_layout.addWidget(btn_diag_nopic)
-        layout.addWidget(gbox_diag)
 
         layout.addStretch(1)
         return tab_toolbox
@@ -1303,9 +1164,16 @@ class MainWindow(QMainWindow):
         self.attack_cooldown.setFixedWidth(60)
         form_right.addRow("攻击冷却（秒）：", self.attack_cooldown)
 
-        self.attack_range_y = QLineEdit()
-        self.attack_range_y.setFixedWidth(60)
-        form_right.addRow("垂直范围 Y:", self.attack_range_y)
+        self.attack_range_up = QLineEdit()
+        self.attack_range_up.setFixedWidth(60)
+        form_right.addRow("向上范围 Y:", self.attack_range_up)
+        self.attack_range_down = QLineEdit()
+        self.attack_range_down.setFixedWidth(60)
+        self.attack_range_up.setToolTip("从人物中心向上可攻击的距离（画面像素）")
+        self.attack_range_down.setToolTip("从人物中心向下可攻击的距离（画面像素）")
+        form_right.addRow("向下范围 Y:", self.attack_range_down)
+        self.attack_range_down.editingFinished.connect(
+            lambda: validate_numerical_input(self.attack_range_down.text(), error_label, 0, 9999))
 
         # Combine left and right forms
         columns = QHBoxLayout()
@@ -1320,8 +1188,8 @@ class MainWindow(QMainWindow):
         error_label = create_error_label()
         self.attack_range_x.editingFinished.connect(
             lambda: validate_numerical_input(self.attack_range_x.text(), error_label, 0, 9999))
-        self.attack_range_y.editingFinished.connect(
-            lambda: validate_numerical_input(self.attack_range_y.text(), error_label, 0, 9999))
+        self.attack_range_up.editingFinished.connect(
+            lambda: validate_numerical_input(self.attack_range_up.text(), error_label, 0, 9999))
         self.attack_cooldown.editingFinished.connect(
             lambda: validate_numerical_input(self.attack_cooldown.text(), error_label, 0, 9999))
 
@@ -1458,15 +1326,15 @@ class MainWindow(QMainWindow):
         self.buff_section_container = QWidget()
         self.buff_section_container.setVisible(False)
         buff_section_layout = QVBoxLayout()
+        from PySide6.QtWidgets import QLayout
+        buff_section_layout.setSizeConstraint(QLayout.SetMinAndMaxSize)
         buff_section_layout.setContentsMargins(0, 0, 0, 0)
-        buff_section_layout.setSpacing(2)
-        buff_section_layout.setAlignment(Qt.AlignLeft)
+        buff_section_layout.setSpacing(12)
         self.buff_section_container.setLayout(buff_section_layout)
 
         # Buff rows layout
         self.buff_layout = QVBoxLayout()
-        self.buff_layout.setSpacing(2)
-        self.buff_layout.setAlignment(Qt.AlignLeft)
+        self.buff_layout.setSpacing(12)
         self.buff_inputs = []
 
         # Initial buff row
@@ -1511,12 +1379,15 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         self.label_map_info = QLabel("请选择地图:")
+        self.label_map_info.setWordWrap(True)
+        self.label_map_info.setTextFormat(Qt.PlainText)
         layout.addWidget(self.label_map_info)
+        self.list_widget_maps.currentItemChanged.connect(lambda item, previous: self.on_map_selected(item) if item else None)
         layout.addWidget(self.list_widget_maps)
 
         # 地图级操作：登记怪物 / 删除地图（2026-09-12）
         row = QHBoxLayout()
-        self.btn_map_mobs = QPushButton("🐾 打哪几种怪…")
+        self.btn_map_mobs = QPushButton("怪物与阈值设置…")
         self.btn_map_mobs.setToolTip(
             "勾选这张图会出现的怪。怪物模板是全局通用的 —— 以前截过的怪"
             "直接勾上就能用，不用重新截。\n"
@@ -1524,6 +1395,17 @@ class MainWindow(QMainWindow):
         self.btn_map_mobs.clicked.connect(self.register_existing_mobs)
         self.btn_map_mobs.setEnabled(False)
         row.addWidget(self.btn_map_mobs)
+        test_mobs = QPushButton('怪物识别测试…')
+        test_mobs.clicked.connect(self.open_monster_test)
+        row.addWidget(test_mobs)
+        capture_row = QHBoxLayout()
+        manual_capture = QPushButton('人工采集（10分钟）…')
+        manual_capture.clicked.connect(self.open_manual_capture)
+        capture_row.addWidget(manual_capture)
+        capture_row.addWidget(QLabel('自动打怪时同步录制，停止后保存'))
+        review_capture = QPushButton('技能画面核验…')
+        review_capture.clicked.connect(self.open_skill_review)
+        capture_row.addWidget(review_capture)
 
         # 📦 内置怪物素材库（2026-09-29）：随包附带一批官方素材转好的现成模板，
         #    用户选完地图点一下就能把该图会出现的怪直接装好并登记，
@@ -1549,22 +1431,25 @@ class MainWindow(QMainWindow):
         self.list_widget_maps.itemSelectionChanged.connect(self._update_delete_btn)
         row.addWidget(self.btn_delete_map)
         layout.addLayout(row)
+        layout.addLayout(capture_row)
 
-        # 🖊 手绘回正线（v0.9，PRD 6.1）—— 主推入口：
-        #    不用开游戏、不用真的掉下去一次，纯鼠标在放大的小地图上点几下就画好。
-        #    老的「补录回正线（要真掉一次）」保留在录制流程里，但不再是首选。
-        row2 = QHBoxLayout()
-        self.btn_draw_home = QPushButton("🖊 手绘回正线（推荐）")
-        self.btn_draw_home.setToolTip(
-            "画一条「掉下去之后怎么走回来」的路线。\n\n"
-            "· 不用开游戏、不用真的掉下去一次 —— 纯鼠标点几下就行\n"
-            "· 打开的是这张图的小地图（放大 4 倍），主线用彩色画着，一眼看出坑在哪\n"
-            "· 第 1 下点落点（角色掉下去站的位置），再点回到主线的路，最后点保存\n\n"
-            "（老办法「补录回正线」仍在录制流程里，只是要先真掉一次。）")
-        self.btn_draw_home.clicked.connect(self._open_home_route_drawer)
-        self.btn_draw_home.setEnabled(False)    # 没选中地图时禁用
-        row2.addWidget(self.btn_draw_home)
-        layout.addLayout(row2)
+        # Current navigation recovers from map/state; no separate home-route setup.
+        self.btn_draw_home = None
+
+        graph_row = QHBoxLayout()
+        self.btn_new_map = QPushButton("增加地图…")
+        self.btn_new_map.setToolTip("展开小地图后，逐项录制平台和绳索，自动生成瞬移连接。")
+        self.btn_new_map.clicked.connect(lambda: self._open_map_graph_editor(create_new=True))
+        graph_row.addWidget(self.btn_new_map)
+        self.btn_map_graph = QPushButton("编辑地图…")
+        self.btn_map_graph.setToolTip('实时查看小地图和采集轨迹，选择平台或绳索后重新录制。')
+        self.btn_map_graph.clicked.connect(lambda: self._open_map_graph_editor(record=True))
+        graph_row.addWidget(self.btn_map_graph)
+        self.graph_navigation_checkbox = QCheckBox("使用人工确认后的地图导航")
+        self.graph_navigation_checkbox.setChecked(self.cfg.get('bot', {}).get('navigation') == 'map_graph')
+        self.graph_navigation_checkbox.toggled.connect(self._set_graph_navigation)
+        graph_row.addWidget(self.graph_navigation_checkbox)
+        layout.addLayout(graph_row)
 
         gbox.setLayout(layout)
         return gbox
@@ -1706,6 +1591,13 @@ class MainWindow(QMainWindow):
             # 引擎还没起来（没点过开始）时这里会失败 —— 属正常，不当错误
             logger.debug(f"[自动喝药] 开关暂时没送到引擎（多半还没开始挂机）：{e}")
 
+    def _show_bars_test_error(self,title,message):
+        if hasattr(self,'potion_test_result'):
+            self.potion_test_result.setText(title+'：'+message.replace('\n\n','\n'))
+            self.potion_test_result.show()
+        else:
+            QMessageBox.warning(self,title,message)
+
     def test_bars_reading(self):
         '''🔍 试一下：抓当前画面读一次血蓝，把结果用人话告诉用户。
 
@@ -1722,7 +1614,7 @@ class MainWindow(QMainWindow):
             from src.utils.common import (crop_frame_to_client,
                                           resolve_title_bar_height)
         except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, "试不了", f"加载识别模块失败：{e}")
+            self._show_bars_test_error("试不了", f"加载识别模块失败：{e}")
             return
 
         # ── 1. 先查环境（不对就别费劲抓帧了）─────────────────────
@@ -1732,7 +1624,7 @@ class MainWindow(QMainWindow):
         except Exception as e:                                   # noqa: BLE001
             ok, title, msg = False, "环境检查失败", str(e)
         if not ok:
-            QMessageBox.warning(self, title, msg)
+            self._show_bars_test_error(title, msg)
             return
 
         # ── 2. 抓一帧 ────────────────────────────────────────────
@@ -1747,15 +1639,14 @@ class MainWindow(QMainWindow):
                 if raw is not None:
                     break
             if raw is None:
-                QMessageBox.warning(
-                    self, "读不到游戏画面",
+                self._show_bars_test_error("读不到游戏画面",
                     "没能从游戏窗口抓到画面。\n\n"
                     "请确认：游戏开着、**没有被最小化**、并且已经在角色画面里"
                     "（不是登录界面）。\n\n"
                     "（被别的窗口挡住没关系，最小化不行。）")
                 return
         except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, "试读失败", f"抓帧出错：{e}")
+            self._show_bars_test_error("试读失败", f"抓帧出错：{e}")
             return
         finally:
             # 抓帧器起了后台线程，用完必须停掉，否则会一直占着资源
@@ -1773,8 +1664,7 @@ class MainWindow(QMainWindow):
                 raw, (int(th), int(tw)),
                 resolve_title_bar_height(self.cfg, tag="试读"), tag="试读")
             if frame is None:
-                QMessageBox.warning(
-                    self, "画面大小对不上",
+                self._show_bars_test_error("画面大小对不上",
                     f"抓到画面了，但裁不成要求的尺寸。\n\n{_msg}\n\n"
                     "请把游戏设成 1366x768、窗口化运行。")
                 return
@@ -1782,7 +1672,7 @@ class MainWindow(QMainWindow):
             detector = BarsDetector.from_dict(self.cfg["bars"])
             hp_res, mp_res = detector.detect(frame)
         except Exception as e:                                   # noqa: BLE001
-            QMessageBox.warning(self, "识别出错", f"读血条时出错：{e}")
+            self._show_bars_test_error("识别出错", f"读血条时出错：{e}")
             return
 
         def _line(label, res):
@@ -1796,7 +1686,11 @@ class MainWindow(QMainWindow):
                 f"（读到数值 = 工具看得见你的血条，功能正常。\n"
                 f"　读不到通常是：血条颜色和预设差太多、或游戏窗口不在前台。\n"
                 f"　读不到时工具**不会**乱喝药 —— 那是特意这么设计的。）")
-        QMessageBox.information(self, "试读结果", body)
+        if hasattr(self,'potion_test_result'):
+            self.potion_test_result.setText(_line('血量',hp_res)+'  ·  '+_line('魔法',mp_res))
+            self.potion_test_result.show()
+        else:
+            QMessageBox.information(self, "试读结果", body)
 
     def _refresh_potion_live(self):
         '''定时刷新喝药面板：环境提示 + 挂机中的实时血蓝读数（2 秒一次）。
@@ -1994,23 +1888,9 @@ class MainWindow(QMainWindow):
             "打开独立窗口：框住一只怪自动抠图存档，换个朝向再截 1~2 帧更稳。")
         self.button_template.clicked.connect(self._hotkey_f3_guarded)
 
-        self.button_route = QPushButton("F4 录挂机路线")
-        self.button_route.setToolTip(
-            "录制地图路线 —— 换挂机地图时用。\n"
-            "⚠️ 必须以管理员身份运行本程序，否则收不到游戏里按的按键。\n\n"
-            "弹出的录制面板全程用鼠标点：\n"
-            "  【开始录（我站好了）】→ 走到平台另一头点【在这折返，存下这段】\n"
-            "  → 走回起点点【这是终点，保存这段】→【主线录完了，下一步】。\n\n"
-            "⚠️ 去程和回程必须分成两段：挤在一段的话同一处既有向左又有向右的\n"
-            "路线像素，角色会一路冲出平台。\n\n"
-            "（键盘：F8 折返分段 / F3 存这段 / F6 回正线两次 / F7 放弃 / q 结束）\n"
-            "录完会自动登记，界面地图列表里直接能选到（无需手改配置）。")
-        self.button_route.clicked.connect(self._hotkey_f4_guarded)
-
         button_layout.addWidget(self.button_start_pause)
         button_layout.addWidget(self.button_nametag)
         button_layout.addWidget(self.button_template)
-        button_layout.addWidget(self.button_route)
 
         layout.addLayout(button_layout)
         layout.addLayout(load_config_layout)
@@ -2098,7 +1978,8 @@ class MainWindow(QMainWindow):
     _MANAGED_SECTIONS = ('bot', 'key', 'directional_attack', 'aoe_skill', 'buff_skill')
 
     def _config_display_name(self, path):
-        return os.path.splitext(os.path.basename(path))[0]
+        name = os.path.splitext(os.path.basename(path))[0]
+        return '我的设置' if name == 'config_custom' else name
 
     def _list_config_files(self):
         """config/ 下所有用户配置（排除出厂默认 / 登记表 / 引擎临时文件 /
@@ -2118,7 +1999,7 @@ class MainWindow(QMainWindow):
         self.config_combo.blockSignals(True)
         self.config_combo.clear()
         for f in self._list_config_files():
-            self.config_combo.addItem(self._config_display_name(f))
+            self.config_combo.addItem(self._config_display_name(f), f)
         self.config_combo.blockSignals(False)
         self.config_combo.setCurrentText(self._config_display_name(self.path_cfg_custom))
         self.config_combo.lineEdit().setPlaceholderText('')
@@ -2163,7 +2044,7 @@ class MainWindow(QMainWindow):
             return
         logger.info(f"[配置切换] 下拉选择了 {name!r}（当前 {self.path_cfg_custom}）")
         self._pending_new_config = False   # 从列表选择 = 取消待新建状态
-        target = f'config/{name}.yaml'
+        target = self.config_combo.itemData(index) or f'config/{name}.yaml'
         if os.path.abspath(target) == os.path.abspath(self.path_cfg_custom):
             logger.info("[配置切换] 选中的就是当前方案，忽略")
             return
@@ -2244,6 +2125,33 @@ class MainWindow(QMainWindow):
             f"已删除「{name}」，当前配置：{self._config_display_name(remaining[0])}", 5000)
         self.config_combo.clearFocus()
 
+    def _copy_current_settings(self):
+        name, ok = QInputDialog.getText(self, '复制当前设置', '为复制后的设置取个名字：')
+        name = name.strip()
+        if not ok or not name or not self._validate_config_name(name):
+            return
+        target = os.path.join(APP_ROOT, 'config', name + '.yaml')
+        if name == '我的设置' or os.path.exists(target):
+            QMessageBox.information(self, '名字已使用', '请换一个名字，现有设置不会被覆盖。')
+            return
+        self._flush_settings()
+        save_yaml(get_cfg_diff(self.cfg_base, self.cfg), target)
+        self.path_cfg_custom = target
+        self._refresh_config_combo()
+        self.save_ui_state()
+        self.statusBar().showMessage(f'已复制当前设置为「{name}」', 5000)
+
+    def _rename_settings_dialog(self):
+        current = self._config_display_name(self.path_cfg_custom)
+        name, ok = QInputDialog.getText(self, '重命名设置', '设置名称：', text=current)
+        name = name.strip()
+        if not ok or not name or name == current or not self._validate_config_name(name):
+            return
+        if name == '我的设置' or os.path.exists(os.path.join(APP_ROOT, 'config', name + '.yaml')):
+            QMessageBox.information(self, '名字已使用', '请换一个名字，现有设置不会被覆盖。')
+            return
+        self._rename_current_config(name)
+
     def _start_new_config(self):
         """🆕 点击后：输入框清空、进入「等待输入新方案名」状态，回车即创建。"""
         if not self._ask_confirm(
@@ -2292,19 +2200,10 @@ class MainWindow(QMainWindow):
         目标名字已存在时 → 询问是否直接切换到那份（用户输入已有方案名的真实意图
         通常就是切换，而不是报错卡住 —— 2026-09-12 用户实测「锁在当前方案」）。"""
         old_path = self.path_cfg_custom
-        target = f'config/{name}.yaml'
+        target = os.path.join(APP_ROOT, 'config', name + '.yaml')
         self._flush_settings()   # 先把当前内容写进旧文件，再整体改名
         if os.path.exists(target):
-            if not self._ask_confirm(
-                    "该名字已有一套配置",
-                    f"config/{name}.yaml 已存在。\n\n"
-                    f"要放弃重命名、直接切换到这套配置吗？\n"
-                    f"（当前方案「{self._config_display_name(old_path)}」会先保存，不会被删除）",
-                    "切换过去", "取消"):
-                self._refresh_config_combo()
-                return
-            self._on_config_activated(name)
-        else:
+            QMessageBox.information(self, '名字已使用', '请换一个名字，现有设置不会被覆盖。')
             self._refresh_config_combo()
             return
         try:
@@ -2315,6 +2214,7 @@ class MainWindow(QMainWindow):
             return
         self.path_cfg_custom = target
         self._refresh_config_combo()
+        self.save_ui_state()
         logger.info(f"[界面] 配置已重命名: {old_path} → {target}")
         self.statusBar().showMessage(f"配置已重命名为「{name}」", 5000)
         self.config_combo.clearFocus()   # 恢复到「点别处」后的显示状态（光标撤出输入框）
@@ -2363,9 +2263,14 @@ class MainWindow(QMainWindow):
         if atk_cfg:
             self.attack_range_x.setText(str(atk_cfg["range_x"]))
             self.attack_cooldown.setText(str(atk_cfg["cooldown"]))
-            self.attack_range_y.setText(str(atk_cfg["range_y"]))
+            self.attack_range_up.setText(str(vertical_reach(atk_cfg)[0]))
+            self.attack_range_down.setText(str(vertical_reach(atk_cfg)[1]))
 
     def apply_config_to_ui(self):
+        if hasattr(self, 'graph_navigation_checkbox'):
+            self.graph_navigation_checkbox.blockSignals(True)
+            self.graph_navigation_checkbox.setChecked(self.cfg.get('bot', {}).get('navigation') == 'map_graph')
+            self.graph_navigation_checkbox.blockSignals(False)
         # === 挂机方式 ===
         # 界面已无该控件（2026-10-01 移除），配置里恒为 normal。
         # 仍显式写回一次：旧配置若残留 "stand"，这里顺手纠正，免得引擎按废案跑。
@@ -2390,7 +2295,8 @@ class MainWindow(QMainWindow):
             atk_cfg = self.cfg["directional_attack"]
         self.attack_range_x.setText(str(atk_cfg["range_x"]))
         self.attack_cooldown.setText(str(atk_cfg["cooldown"]))
-        self.attack_range_y.setText(str(atk_cfg["range_y"]))
+        self.attack_range_up.setText(str(vertical_reach(atk_cfg)[0]))
+        self.attack_range_down.setText(str(vertical_reach(atk_cfg)[1]))
 
         # === Key Bindings ===
         key_cfg = self.cfg["key"]
@@ -2450,29 +2356,15 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, index):
         tab_name = self.tabs.tabText(index)
-        if tab_name == "游戏画面":
+        if tab_name in ('总览', '地图'):
             self.controller.enable_bot_viz()
-
-        elif tab_name == "路线地图":
-            self.controller.enable_bot_viz()
-
-        elif tab_name == "主界面":
-            self.controller.disable_bot_viz()
-            self.apply_config_to_ui()
-            self.refresh_map_list()   # 回主界面时立即看一眼有没有新地图
-
-        elif tab_name == "工具箱":
-            self.controller.disable_bot_viz()
-
         else:
-            logger.error(f"[界面] 未预期的标签页: {tab_name}")
             self.controller.disable_bot_viz()
-
-        if tab_name in TAB_WINDOW_SIZE:
-            self.resize(TAB_WINDOW_SIZE[tab_name][0],
-                        TAB_WINDOW_SIZE[tab_name][1])
-
-        logger.info(f"[界面] 用户切换到标签页: {tab_name}")
+        if tab_name in ('总览', '地图', '设置'):
+            self.refresh_map_list()
+        if tab_name == '记录' and hasattr(self, 'reload_record_list'):
+            self.reload_record_list()
+        logger.info(f'[界面] 用户切换到: {tab_name}')
 
     def _open_home_route_drawer(self):
         '''
@@ -2636,13 +2528,107 @@ class MainWindow(QMainWindow):
 
         self.refresh_map_list()
 
+    def _set_graph_navigation(self, enabled):
+        self.cfg.setdefault('bot', {})['navigation'] = 'map_graph' if enabled else 'legacy'
+
+    def _debug_edit_map(self):
+        if self.button_start_pause.isChecked():self.button_start_pause.click()
+        self.selected_map=getattr(self,'selected_map',None) or self.cfg.get('bot',{}).get('map','')
+        self._open_map_graph_editor()
+        self.tab_map_debug.ignore_before=time.monotonic()
+        self.tab_map_debug.map_name=None
+        self.tab_map_debug.refresh()
+
+    def _open_map_graph_editor(self, create_new=False, record=True):
+        if getattr(self.controller.auto_bot, 'thread_auto_bot', None) is not None and self.controller.auto_bot.thread_auto_bot.is_alive():
+            QMessageBox.information(self, '请先停止挂机', '停止挂机后再编辑地图。')
+            return
+        name = "" if create_new else self.selected_map
+        ok = bool(name)
+        if not ok:
+            name, ok = QInputDialog.getText(self, '增加地图', '新地图名称（将从游戏获取小地图）')
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in ('.', '..') or any(c in name for c in '/\\:*?"<>|'):
+            QMessageBox.warning(self, '地图名称无效', '地图名称不能含路径或特殊字符。')
+            return
+        folder = os.path.join(APP_ROOT, 'minimaps', name)
+        path = os.path.join(folder, 'map.png')
+        if create_new and os.path.exists(folder):
+            QMessageBox.warning(self, '地图已存在', '该名称已存在，请使用新名称，或选择已有地图后点击编辑地图。')
+            return
+        if not os.path.exists(path):
+            try:
+                from tools.template_capture import grab_game_frame
+                from src.utils.common import get_minimap_loc_size, imwrite_unicode
+                frame = grab_game_frame(self.cfg['game_window']['title'])
+                from src.utils.mapping_capture import client_frame, minimap_rect
+                frame = client_frame(frame, self.cfg) if frame is not None else None
+                result = minimap_rect(frame) if frame is not None else None
+                if result is None:
+                    raise ValueError('没有识别到小地图边框，请打开游戏小地图。')
+                x, y, w, h = result
+                # Same crop and configurable padding as routeRecorder.
+                mini = frame[y+1:y+h-1, x+1:x+w-1]
+                pad = int(self.cfg['route_recoder']['map_padding'])
+                canvas = np.zeros((mini.shape[0]+2*pad, mini.shape[1]+2*pad, 3), dtype=np.uint8)
+                canvas[pad:pad+mini.shape[0], pad:pad+mini.shape[1]] = mini
+                os.makedirs(folder, exist_ok=True)
+                if not imwrite_unicode(path, canvas):
+                    raise ValueError('地图图片保存失败')
+                self.data.setdefault('map_mobs_mapping', {}).setdefault(name, [])
+                save_yaml(self.data, os.path.join(APP_ROOT, 'config', 'config_data.yaml'))
+                self.refresh_map_list()
+            except Exception as exc:
+                QMessageBox.warning(self, '地图获取失败', str(exc)); return
+        try:
+            from src.ui.walk_map_recorder import WalkMapRecorder
+            dialog = WalkMapRecorder(folder, self.cfg, self)
+            snapshot=getattr(self.controller.auto_bot,'_map_debug_snapshot',None)
+            if snapshot and snapshot['map']==name:
+                dialog.debug_position=snapshot['position']
+            dialog.exec()
+            self.tab_map_debug.ignore_before=time.monotonic()
+            self.tab_map_debug.map_name=None
+            self.tab_map_debug.refresh()
+            if dialog.confirmed_graph:
+                self.selected_map = name
+                self.cfg.setdefault('bot', {})['map'] = name
+                self.graph_navigation_checkbox.setChecked(True)
+                save_yaml(self.cfg, self.path_cfg_custom)
+                for i in range(self.list_widget_maps.count()):
+                    item = self.list_widget_maps.item(i)
+                    if item.data(Qt.UserRole) == name:
+                        self.list_widget_maps.setCurrentRow(i); break
+                self.statusBar().showMessage('地图已确认，已启用地图导航；点击开始后运行', 10000)
+        except Exception as exc:
+            QMessageBox.warning(self, '地图审核失败', str(exc))
+
     def on_map_selected(self, item):
         # Parse English name from item text
-        map_name = item.text().split(" (")[0]
+        map_name = item.data(Qt.UserRole) or item.text().split(" (")[0]
         self.selected_map = map_name
+        self.refresh_map_config_summary()
 
-        map_path = os.path.join("minimaps", map_name)
-        self.label_map_info.setText(f"已选择地图: {map_path}")
+    def refresh_map_config_summary(self):
+        if not hasattr(self,'label_map_info'):return
+        name=getattr(self,'selected_map',None)
+        if not name:
+            self.label_map_info.setText('请选择地图，选中后显示怪物与识别阈值。')
+            return
+        from src.utils.monster_threshold import map_threshold
+        default=self.cfg.get('monster_detect',{}).get('diff_thres',.1)
+        threshold=map_threshold(self.data,name,default)
+        own=name in (self.data.get('map_monster_thresholds',{}) or {})
+        mobs=(self.data.get('map_mobs_mapping',{}) or {}).get(name,[])
+        scope='当前地图独立设置' if own else '沿用全局默认'
+        self.label_map_info.setText(f'当前地图：{name}\n识别怪物（{len(mobs)} 种）：'+
+            ('、'.join(mobs) if mobs else '尚未选择，请点击「怪物与阈值设置」')+
+            f'\n识别阈值：{threshold:.3f}（{scope}；越大越宽松）')
+        self.label_map_info.setToolTip('显示保存的配置；修改后下次开始挂机生效。')
+        if hasattr(self,'refresh_map_card'):
+            self.refresh_map_card()
 
     def toggle_auto_buff(self, state):
         '''
@@ -2714,6 +2700,9 @@ class MainWindow(QMainWindow):
         return box.clickedButton() is btn_go
 
     def toggle_start_ui(self):
+        if getattr(self.controller, 'manual_capture_active', False):
+            self.button_start_pause.setChecked(False)
+            return
         if self.button_start_pause.isChecked(): # When start autobot
             self.update_cfg_from_main_ui()
 
@@ -2733,7 +2722,7 @@ class MainWindow(QMainWindow):
 
             if ret == 0: # Start success
                 self.button_start_pause.setText("⏸ 暂停 (F1)")
-                self.button_start_pause.setStyleSheet("background-color: lightgreen;")
+                self.button_start_pause.setStyleSheet("background-color: #1256b0; color: white;")
                 self.set_gbox_enabled(False)
             elif ret == -2:
                 # 按键驱动不可用（2026-09-27 加）——
@@ -2766,14 +2755,8 @@ class MainWindow(QMainWindow):
                     "如果就这么开始，角色会一动不动（看不出原因），"
                     "所以这里先拦下来了。")
                 box.setInformativeText(
-                    "常见原因：\n"
-                    "　· 路线没有**终点标记**（录制时没走到最后一步就保存了）\n"
-                    "　· 这张图根本没录过路线\n"
-                    "　· 去程和回程叠在了同一段里\n\n"
-                    "**怎么修**：按 F4 重录这张图 ——\n"
-                    "　起点开始走 → 中途要折返就按一次分段 → "
-                    "**走到终点按 F3 保存**（这一步才会盖上终点标记）。\n\n"
-                    "日志区里有 `[路线校验]` 打出的具体原因，照着看更准。")
+                    "请选择【编辑地图】，确认平台与连接后启用地图导航。\n"
+                    "新增地图请使用【增加地图】，逐项采集平台和绳索。")
                 box.exec_()
             else:
                 # Start failed
@@ -2788,7 +2771,6 @@ class MainWindow(QMainWindow):
             self.controller.pause_bot()
             self.set_gbox_enabled(True)
             clear_debug_canvas(self.debug_canvas) # Set debug viz to null
-            clear_debug_canvas(self.route_map_canvas) # Set debug viz to null
 
     def launch_nametag_calibration(self):
         # 名字在主界面的图形对话框里输入（中文输入法友好），工具拿 --name 直进框选，
@@ -2824,7 +2806,7 @@ class MainWindow(QMainWindow):
                     "截怪物模板时必须知道「这只怪属于哪张图」，所以要先有地图。\n\n"
                     "而你还没有任何地图。地图是在**录挂机路线**时自动创建的：\n\n"
                     "　1. 确认本程序是「以管理员身份运行」（否则收不到游戏里的按键）\n"
-                    "　2. 回到主界面按 F4（或点「录路线」），在游戏里走一遍挂机路线并保存\n"
+                    "　2. 点击【增加地图】，检查平台与连接并确认启用导航\n"
                     "　3. 关闭界面重新打开 —— 刚录的图就会出现在下方地图列表里\n"
                     "　4. 点选它，再回来按 F3 截怪\n\n"
                     "（详细步骤见上方「换一张新图挂机 —— 照着做 5 步」。）")
@@ -2859,12 +2841,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from src.utils.mob_library import load_index, installed_mobs
+            from src.utils.mob_library import available_index, installed_mobs
         except Exception as e:
             QMessageBox.warning(self, "素材库不可用", f"{e}")
             return
 
-        index = load_index()
+        index = available_index()
         if not index:
             QMessageBox.information(
                 self, "素材库是空的",
@@ -2892,7 +2874,7 @@ class MainWindow(QMainWindow):
             f"勾选这张图会出现的怪（素材库 {len(index)} 种，按等级排序）：\n"
             "· 已装好的会自动登记到这张图\n"
             "· 没装过的会自动装好再登记\n"
-            "· 库里没有的怪，仍可用【截取怪物模板】自己截"))
+            "· F3 新截取的素材会自动出现在这里，可用于其他地图"))
 
         # 搜索框：82 种怪滚动找太累，直接过滤
         edit_filter = QLineEdit()
@@ -2910,6 +2892,8 @@ class MainWindow(QMainWindow):
             ent = index.get(name) or {}
             lv = ent.get('level', '')
             tip = '  [已装]' if name in have else ''
+            if ent.get('local_frames'):
+                tip=f"  [本地素材 {ent['local_frames']} 帧]"
             item = QListWidgetItem(f"Lv{lv:<4} {name}{tip}")
             item.setData(Qt.UserRole, name)
             lw.addItem(item)
@@ -3000,6 +2984,56 @@ class MainWindow(QMainWindow):
         msg += "\n\n直接点开始即可。"
         QMessageBox.information(self, "已登记", msg)
 
+    def open_monster_test(self):
+        if not self.selected_map:
+            QMessageBox.information(self,'请选择地图','请先选择要测试的地图。');return
+        thread=getattr(self.controller.auto_bot,'thread_auto_bot',None)
+        if thread is not None and thread.is_alive():
+            QMessageBox.information(self,'请先停止挂机','停止挂机后再进行识别测试，避免两个检测任务争用性能。');return
+        try:
+            from src.ui.monster_test import MonsterTest
+            dialog=MonsterTest(self.selected_map,self.cfg,self)
+            dialog.exec()
+            self.data=load_yaml(os.path.join(APP_ROOT,'config','config_data.yaml'))
+            self.refresh_map_config_summary()
+        except Exception as exc:QMessageBox.warning(self,'测试启动失败',str(exc))
+
+    def open_manual_capture(self):
+        if not self.selected_map:
+            QMessageBox.information(self, '请选择地图', '请先选择采集的地图。')
+            return
+        self.update_cfg_from_main_ui()
+        self.controller.manual_capture_active = True
+        try:
+            self.controller.terminate_bot()
+            bot = self.controller.auto_bot
+            for thread in (getattr(bot, 'thread_auto_bot', None),
+                           getattr(getattr(bot, 'kb', None), 'thread_output', None)):
+                if thread is not None:
+                    thread.join(timeout=3)
+                    if thread.is_alive():
+                        raise RuntimeError('自动化线程仍在退出，请稍后再打开人工采集。')
+            self.button_start_pause.setChecked(False)
+            self.button_start_pause.setText('▶ 开始 (F1)')
+            self.button_start_pause.setStyleSheet('')
+            self.set_gbox_enabled(True)
+            from src.ui.manual_capture import ManualCapture
+            dialog = ManualCapture(self.selected_map, self.cfg, self)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.warning(self, '人工采集', str(exc))
+        finally:
+            self.controller.manual_capture_active = False
+
+    def open_skill_review(self):
+        from PySide6.QtWidgets import QFileDialog
+        path=QFileDialog.getExistingDirectory(self,'选择人工会话或 video 下的 .session 目录',APP_ROOT)
+        if not path:return
+        try:
+            from src.ui.skill_review import SkillReview
+            SkillReview(path,self).exec()
+        except Exception as exc:QMessageBox.warning(self,'画面核验',str(exc))
+
     def register_existing_mobs(self):
         '''
         从**已有**怪物库里勾选，直接登记到当前图 —— 不用重新截（2026-09-12）。
@@ -3052,6 +3086,22 @@ class MainWindow(QMainWindow):
             lw.addItem(item)
             item.setSelected(name in registered)
         v.addWidget(lw)
+        from PySide6.QtWidgets import QDoubleSpinBox
+        from src.utils.monster_threshold import map_threshold
+        use_map_threshold = QCheckBox('本地图使用独立识别阈值')
+        use_map_threshold.setChecked(map_name in (data.get('map_monster_thresholds', {}) or {}))
+        threshold_spin = QDoubleSpinBox()
+        threshold_spin.setRange(.001, 1.0)
+        threshold_spin.setDecimals(3)
+        threshold_spin.setSingleStep(.01)
+        threshold_spin.setValue(map_threshold(data,map_name,self.cfg['monster_detect']['diff_thres']))
+        threshold_spin.setEnabled(use_map_threshold.isChecked())
+        use_map_threshold.toggled.connect(threshold_spin.setEnabled)
+        v.addWidget(use_map_threshold)
+        v.addWidget(threshold_spin)
+        explanation=QLabel('匹配误差上限：越大越宽松，越小越严格。\n取消勾选则使用全局默认值；保存后下次开始挂机生效。')
+        explanation.setWordWrap(True)
+        v.addWidget(explanation)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
@@ -3072,6 +3122,14 @@ class MainWindow(QMainWindow):
             register_map(map_name)
             added = [m for m in picked if m not in registered and register_mob(map_name, m)]
             removed = [m for m in registered - picked if unregister_mob(map_name, m)]
+            # Reload after registry writes so monster selections are preserved.
+            updated=load_yaml(REG_PATH) or {}
+            thresholds=updated.setdefault('map_monster_thresholds',{})
+            if use_map_threshold.isChecked():thresholds[map_name]=threshold_spin.value()
+            else:thresholds.pop(map_name,None)
+            save_yaml(updated,REG_PATH)
+            self.data=updated
+            self.refresh_map_config_summary()
         except Exception as e:
             QMessageBox.warning(self, "登记失败", f"{e}")
             return
@@ -3097,6 +3155,8 @@ class MainWindow(QMainWindow):
         ⚠️ 独立 bat 启动的录制器不在此列（用户 2026-09-12：那些 bat 是历史残留，
         功能全做好后会删掉；录制器今后只从界面 F4 启动，届时这里是唯一入口）。
         """
+        if getattr(self.controller, 'manual_capture_active', False):
+            return True
         if not self._recorder_alive():
             return False
         self.statusBar().showMessage(
@@ -3736,7 +3796,9 @@ class MainWindow(QMainWindow):
                 self.basic_attack_key, self.cfg["key"].get("directional_attack"))
             da = self.cfg["directional_attack"]
             da["range_x"] = _num(self.attack_range_x.text(), da["range_x"], int)
-            da["range_y"] = _num(self.attack_range_y.text(), da["range_y"], int)
+            da["range_up"] = _num(self.attack_range_up.text(), vertical_reach(da)[0], int)
+            da["range_down"] = _num(self.attack_range_down.text(), vertical_reach(da)[1], int)
+            da["range_y"] = da["range_up"] + da["range_down"]
             da["cooldown"] = _num(self.attack_cooldown.text(), da["cooldown"], float)
         elif self.attack_mode.currentText() == "AOE技能":
             self.cfg["bot"]["attack"] = "aoe_skill"
@@ -3744,7 +3806,9 @@ class MainWindow(QMainWindow):
                 self.basic_attack_key, self.cfg["key"].get("aoe_skill"))
             ao = self.cfg["aoe_skill"]
             ao["range_x"] = _num(self.attack_range_x.text(), ao["range_x"], int)
-            ao["range_y"] = _num(self.attack_range_y.text(), ao["range_y"], int)
+            ao["range_up"] = _num(self.attack_range_up.text(), vertical_reach(ao)[0], int)
+            ao["range_down"] = _num(self.attack_range_down.text(), vertical_reach(ao)[1], int)
+            ao["range_y"] = ao["range_up"] + ao["range_down"]
             ao["cooldown"] = _num(self.attack_cooldown.text(), ao["cooldown"], float)
         else:
             logger.error(f"[update_cfg_from_main_ui] Unsupported attack mode: {self.cfg['bot']['attack']}")
@@ -3783,9 +3847,14 @@ class MainWindow(QMainWindow):
 
         # Map selection
         self.cfg["bot"]["map"] = self.selected_map
+        if hasattr(self, 'graph_navigation_checkbox'):
+            self.cfg['bot']['navigation'] = 'map_graph' if self.graph_navigation_checkbox.isChecked() else 'legacy'
 
     def update_debug_canvas(self, img):
         if img is None:
+            return
+        if self.tabs.currentWidget() is getattr(self, 'tab_maps', self.tab_map_debug):
+            self.tab_map_debug.annotated_frame=(img,time.monotonic())
             return
 
         height, width, _ = img.shape
@@ -3808,28 +3877,6 @@ class MainWindow(QMainWindow):
                             Qt.SmoothTransformation)
 
         self.debug_canvas.setPixmap(scaled_pixmap)
-
-    def update_route_map_canvas(self, img):
-        if img is None:
-            return
-
-        height, width, _ = img.shape
-        # ⚠️ 必须显式传 bytesPerLine：不传时 Qt 会把每行字节数向上对齐到 4 的倍数。
-        #    客户区宽 1366 → 每行 1366*3 = 4098 字节（不是 4 的倍数），
-        #    Qt 会按 4100 读 → 每行多 2 字节、偏移逐行累积 → 画面出现**横线 + 整体斜掉**，
-        #    同时颜色通道错乱看起来发灰（2026-09-12 用户反馈）。
-        #    实测：不指定时 Qt bytesPerLine=4100，显式指定后=4098。
-        #    前提：img 必须是 C-contiguous（引擎侧 img_frame_debug / img_route_debug 都是）。
-        qimg = QImage(img.data, width, height, width * 3, QImage.Format_BGR888)
-        pixmap = QPixmap.fromImage(qimg)
-
-        scaled_pixmap = pixmap.scaled(
-                            self.route_map_canvas.width(),
-                            self.route_map_canvas.height(),
-                            Qt.KeepAspectRatio,  # 2026-09-12 改：原本 IgnoreAspectRatio 会把 1366x768 硬拉到 1502x844 导致画面变斜（比例 1.78→1.78 几乎一致，改 KeepAspectRatio 无黑边且不形变）
-                            Qt.SmoothTransformation)
-
-        self.route_map_canvas.setPixmap(scaled_pixmap)
 
     def update_advance_setting_ui_from_cfg(self):
         '''
@@ -3872,39 +3919,42 @@ class MainWindow(QMainWindow):
 
     def add_buff_row(self, key="", cooldown=""):
         row_widget = QWidget()
+        row_widget.setObjectName("buffRow")
         row_layout = QHBoxLayout()
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(4)  # Tight spacing
+        row_layout.setSpacing(12)
 
         # Buff Key
-        label_1 = QLabel("按 ")
+        label_1 = QLabel("技能按键")
         label_1.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
 
         key_edit = SingleKeyEdit()
-        key_edit.setFixedWidth(100)
+        key_edit.setMinimumWidth(100)
+        key_edit.setMaximumWidth(140)
+        for field in key_edit.findChildren(QLineEdit):
+            field.setPlaceholderText("按下按键")
         if key:
             key_edit.set_key(key)
         key_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
 
-        row_layout.addWidget(label_1)
-        row_layout.addWidget(key_edit)
+        key_column=QVBoxLayout();key_column.setSpacing(6)
+        key_column.addWidget(label_1);key_column.addWidget(key_edit)
+        row_layout.addLayout(key_column,1)
 
         # Cooldown
-        label_cd = QLabel(" 键，每隔 ")
+        label_cd = QLabel("间隔（秒）")
         label_cd.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
 
         cooldown_edit = QLineEdit()
         cooldown_edit.setPlaceholderText("0")
         cooldown_edit.setText(cooldown)
-        cooldown_edit.setFixedWidth(60)
+        cooldown_edit.setMinimumWidth(72)
+        cooldown_edit.setMaximumWidth(100)
         cooldown_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
 
-        label_second = QLabel(" 秒。")
-        label_second.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
-
-        row_layout.addWidget(label_cd)
-        row_layout.addWidget(cooldown_edit)
-        row_layout.addWidget(label_second)
+        interval_column=QVBoxLayout();interval_column.setSpacing(6)
+        interval_column.addWidget(label_cd);interval_column.addWidget(cooldown_edit)
+        row_layout.addLayout(interval_column,1)
 
         # Error label (optional)
         error_label = QLabel()
@@ -3916,32 +3966,37 @@ class MainWindow(QMainWindow):
             lambda: validate_numerical_input(cooldown_edit.text(), error_label, 0, 9999))
 
         # Delete button
-        button_delete = QPushButton("-")
-        button_delete.setFixedWidth(20)
+        button_delete = QPushButton("删除")
+        button_delete.setObjectName("deleteBuffRow")
+        button_delete.setToolTip("删除此增益技能")
+        button_delete.setMinimumWidth(66)
         button_delete.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button_delete.clicked.connect(lambda: self.remove_buff_row(row_widget, error_label))
-        row_layout.addWidget(button_delete)
+        row_layout.addWidget(button_delete,alignment=Qt.AlignBottom)
 
         # Align to left and fix widget height
-        row_layout.setAlignment(Qt.AlignLeft)
         row_widget.setLayout(row_layout)
-        row_widget.setFixedHeight(28)  # Optional: reduce vertical height
+        row_widget.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Minimum)
+        row_widget.setMinimumHeight(72)
 
         self.buff_layout.addWidget(error_label)
         self.buff_layout.addWidget(row_widget)
         self.buff_inputs.append((key_edit, cooldown_edit))
+        key_edit.keySequenceChanged.connect(lambda:self.refresh_key_conflicts() if hasattr(self,'refresh_key_conflicts') else None)
 
     def remove_buff_row(self, row_widget: QWidget, error_label: QLabel):
+        self.buff_inputs = [
+            entry for entry in self.buff_inputs if not row_widget.isAncestorOf(entry[0])
+        ]
         # Remove from layout_main
         self.buff_layout.removeWidget(row_widget)
         self.buff_layout.removeWidget(error_label)
         row_widget.setParent(None)
         error_label.setParent(None)
 
-        # Remove from tracking list
-        self.buff_inputs = [
-            entry for entry in self.buff_inputs if entry[0] != row_widget
-        ]
+        row_widget.deleteLater()
+        error_label.deleteLater()
+        if hasattr(self,'refresh_key_conflicts'):self.refresh_key_conflicts()
 
     def append_log(self, message: str, level: int):
         # ⚠️ 这三个色是配 **深色背景**（#1a1a1a，见 create_log_gbox）调的，别改回 white。
@@ -3952,6 +4007,10 @@ class MainWindow(QMainWindow):
             color = QColor("#ff5555")      # ERROR：红（纯红在深底上发暗，提亮一档）
         elif level >= logging.WARNING:
             color = QColor("#ffb86c")      # WARNING：橙
+
+        if self.log_output.property('lightTheme'):
+            color = QColor('#b73c48' if level >= logging.ERROR else
+                           '#a06a19' if level >= logging.WARNING else '#52647f')
 
         fmt = QTextCharFormat()
         fmt.setForeground(color)
@@ -3966,6 +4025,9 @@ class MainWindow(QMainWindow):
         '''
         Call when user close the UI window
         '''
+        if getattr(self.controller, 'manual_capture_active', False):
+            event.ignore()
+            return
         # Collect current UI setting and update to self.cfg
         self.update_cfg_from_main_ui()
         # 标定等工具可能在此期间写过磁盘配置 —— 合并后再算差异，避免覆盖（§8.7 同源问题）

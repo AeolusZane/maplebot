@@ -89,6 +89,10 @@ def main():
 
     try:
         from src.main import main as bot_main
+        from src.utils.record_retention import start_cleanup
+        from src.utils.paths import APP_ROOT
+        from src.utils.logger import logger
+        start_cleanup(APP_ROOT, logger)
         bot_main()
     except SystemExit:
         raise

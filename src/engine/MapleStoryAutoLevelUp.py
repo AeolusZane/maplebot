@@ -1,3 +1,4 @@
+from src.utils.attack_geometry import vertical_reach
 '''
 Execute this script:
 python mapleStoryAutoLevelUp.py --map cloud_balcony --monster brown_windup_bear,pink_windup_bear
@@ -72,12 +73,20 @@ class MapleStoryAutoBot:
         Init MapleStoryAutoBot
         '''
         self.args = args # User args
+        self.graph_navigator = None
+        self._hunt_scan_time=-100;self._hunt_empty_scans=0;self._hunt_calibration_notice=False
+        self._visible_scan_time=-100;self.visible_monsters=[]
+        self._visible_source_time=-100;self._visible_submit_time=-100;self._combat_scan_time=-101
+        self._mob_memory=None
+        self._monster_batches=None
         self.cfg = None # Configuration
         self.idx_routes = 0 # Index of route map
         self.monsters_info = {} # monster information
         self.monsters = [] # monster detected in current frame
         self.fps = 0 # Frame per second
         self.video_writer = None # For video recording feature
+        import threading
+        self._video_lock = threading.RLock()
         self.video_tmp_path = None   # 实际写入的临时文件（纯 ASCII 路径）
         self.video_final_path = None # 最终要落到的 video/ 位置
         self.color_code = {} # For color code instruction
@@ -94,6 +103,9 @@ class MapleStoryAutoBot:
         # Flags
         self.is_first_frame = True # first frame flag
         self.is_terminated = False # Close all object and thread if True
+        import threading
+        self._detection_lock=threading.RLock()
+        cv2.setNumThreads(2) # Bound nested parallelism across near/full detection and UI.
         self.is_on_ladder = False # Character is on ladder or not
         self.is_show_debug_window = not args.disable_viz #
         self.is_need_show_debug_window = not args.disable_viz #
@@ -156,6 +168,9 @@ class MapleStoryAutoBot:
         # Timers
         self.t_last_frame = time.time() # Last frame timer, for fps calculation
         self.t_watch_dog = time.time() # Last movement timer
+        self._combat_hold=False
+        from src.states.combat_hold import CombatHold
+        self._combat_tracker=CombatHold();self._combat_face=None
         self.t_last_attack = time.time() # Last attack timer for cooldown
         self.t_last_minimap_update = time.time()
         # 运行状态日志（2026-09-12 加）：主循环每 5 秒打一行关键状态。
@@ -493,6 +508,9 @@ class MapleStoryAutoBot:
         try:
             hp_res, mp_res = self.bars_detector.detect(img_frame)
             self.hp_percent, self.mp_percent = self.bars_smoother.update(hp_res, mp_res)
+            from src.states.damage_response import DamageResponse
+            if getattr(self,'_damage_response',None) is None:self._damage_response=DamageResponse()
+            self._damage_response.observe(self.hp_percent,time.monotonic())
 
             if self.potion_drinker is None:
                 return
@@ -690,6 +708,15 @@ class MapleStoryAutoBot:
         # verify_load_config 的【4】`self.cfg 就是传入的 cfg` 断言交代（虽然
         # 赋了同一个对象结果一样，但显式赋值更稳）。
         self.cfg = cfg
+        self.graph_navigator = None
+        self._hunt_scan_time=-100;self._hunt_empty_scans=0;self._hunt_calibration_notice=False
+        self._visible_scan_time=-100;self.visible_monsters=[]
+        self._visible_source_time=-100;self._visible_submit_time=-100;self._combat_scan_time=-101
+        self._mob_memory=None
+        self._graph_status_last = None
+        self._monster_batches=None
+        self._monster_tracks=None
+        self._damage_response=None
         # 先校验配置完整性（缺键会让主循环在运行中静默崩溃，见 _check_cfg_completeness）
         self._check_cfg_completeness(cfg)
 
@@ -767,6 +794,20 @@ class MapleStoryAutoBot:
             # Load map.png from minimaps/
             self.img_map = load_image(f"minimaps/{map_name}/map.png",
                                       cv2.IMREAD_COLOR)
+            if cfg['bot'].get('navigation') == 'map_graph':
+                from src.navigation.map_graph import load_graph, Navigator
+                graph = load_graph(resource_path(f'minimaps/{map_name}/navigation.json'), self.img_map)
+                if any(e['enabled'] and e['kind']=='teleport' for e in graph['edges']) and not cfg['key'].get('teleport'):
+                    raise ValueError('地图含瞬移连接，请先设置瞬移键')
+                if any(e['enabled'] and e['kind'] in ('jump','drop') for e in graph['edges']) and not cfg['key'].get('jump'):
+                    raise ValueError('地图含跳跃或下跳连接，请先设置跳跃键')
+                self.graph_navigator = Navigator(graph)
+                from src.navigation.platform_sweep import PlatformSweep
+                self.graph_navigator.platform_sweep=PlatformSweep()
+                if cfg.get('key',{}).get('teleport'):
+                    from src.navigation.horizontal_motion import HorizontalMotion
+                    self.graph_navigator.horizontal_motion=HorizontalMotion()
+                logger.info('[地图导航] 已加载人工确认的平台与连接；不使用旧路线指令')
             # Load route*.png from minimaps/
             route_files = sorted(glob.glob(resource_path(f"minimaps/{map_name}/route*.png")))
             # route_rest.png 是上游遗留的「休息路线」；route_home.png 是本分支的回正线
@@ -774,6 +815,8 @@ class MapleStoryAutoBot:
             route_files = [p for p in route_files
                            if not p.endswith("route_rest.png")
                            and not p.endswith("route_home.png")]
+            if self.graph_navigator is not None:
+                route_files = []
             self.img_routes = []
             for route_file in route_files:
                 img = cv2.cvtColor(load_image(route_file), cv2.COLOR_BGR2RGB)
@@ -910,6 +953,12 @@ class MapleStoryAutoBot:
             #    self.cfg 是在本函数**末尾**（约 402 行）才赋值的，这里还是 None，
             #    self.cfg.get(...) 会抛 AttributeError。而 load_config 里没有
             #    try/except，异常不进日志 → 界面上就是「点开始没反应」，无从查起。
+            from src.utils.monster_threshold import map_threshold
+            cfg['monster_detect']['effective_diff_thres']=map_threshold(
+                self.data,cfg['bot']['map'],cfg['monster_detect']['diff_thres'])
+            logger.info(f"[怪物阈值] 地图 {cfg['bot']['map']}：匹配误差上限 "
+                        f"{cfg['monster_detect']['effective_diff_thres']:.3f}，"
+                        f"全局默认 {cfg['monster_detect']['diff_thres']:.3f}")
             match_all = cfg.get("monster_detect", {}).get("match_all_mobs", True)
             if match_all:
                 monster_root = resource_path("monster")
@@ -1072,8 +1121,18 @@ class MapleStoryAutoBot:
         logger.info(f"[前台守卫] 游戏窗口句柄 = {self.kb.game_hwnd}")
 
         # Reset all timers
+        from src.utils.player_tracking import PlayerTracking, AttackRecheck
+        self._player_tracking=PlayerTracking();self._attack_recheck=AttackRecheck()
+        self._latency_ms=0.;self._latency_peak_ms=0.;self._visible_scan_peak_ms=0.
+        self._name_global_time=-100.
+        self._force_name_recheck=False;self._player_reference_reliable=False
+        from src.navigation.startup_position import StartupPosition
+        self._startup_position=StartupPosition()
         self.t_last_frame = time.time()
         self.t_watch_dog = time.time()
+        self._combat_hold=False
+        from src.states.combat_hold import CombatHold
+        self._combat_tracker=CombatHold();self._combat_face=None
         self.t_last_attack = time.time()
         self.t_last_minimap_update = time.time()
 
@@ -1084,6 +1143,14 @@ class MapleStoryAutoBot:
             self.fsm.set_init_state("hunting")
 
         # Start Auto Bot main thread
+        # Every run owns its recording; establish evidence before decisions begin.
+        try:
+            self.start_record()
+        except Exception:
+            self.terminate_threads()
+            self.stop_record()
+            raise
+        self.is_terminated = False
         self.thread_auto_bot = threading.Thread(target=self.loop)
         self.thread_auto_bot.start()
         self.is_first_frame = True
@@ -1111,9 +1178,15 @@ class MapleStoryAutoBot:
         logger.debug("[disable_viz] is_show_debug_window = False")
 
     def start_record(self):
+        with self._video_lock:
+            return self._start_record_locked()
+
+    def _start_record_locked(self):
         '''
         Start record
         '''
+        if self.video_writer is not None:
+            return
         # Prepare video writer if need to record
         if not self.is_show_debug_window:
             self.enable_viz()
@@ -1134,10 +1207,22 @@ class MapleStoryAutoBot:
         _wh = (self.cfg["game_window"]["size"][1],
                self.cfg["game_window"]["size"][0])
         self.video_writer = cv2.VideoWriter(self.video_tmp_path, fourcc, 10, _wh)
+        if not self.video_writer.isOpened():
+            self.video_writer.release()
+            self.video_writer = None
+            raise RuntimeError('录像文件无法打开')
+        from src.utils.input_evidence import begin_auto
+        self._video_evidence = begin_auto(path + '.session', self.cfg,
+                                         getattr(self.capture,'window_hwnd',None))
+        self._video_frame_index = 0
 
         logger.info(f"[start_record] Record video to {path}")
 
     def stop_record(self):
+        with self._video_lock:
+            return self._stop_record_locked()
+
+    def _stop_record_locked(self):
         '''
         Stop Record
         '''
@@ -1154,6 +1239,8 @@ class MapleStoryAutoBot:
                 logger.error(f"[stop_record] 搬移视频失败: {e}")
                 logger.error(f"           临时文件仍在: {self.video_tmp_path}")
         logger.info("[stop_record] Stop recording")
+        from src.utils.input_evidence import end_auto
+        end_auto()
 
     def get_player_location_by_nametag(self):
         '''
@@ -1208,7 +1295,7 @@ class MapleStoryAutoBot:
         )
 
         # Get last frame name tag location
-        if self.is_first_frame:
+        if self.is_first_frame or not self.nametag_ever_hit or getattr(self,'_force_name_recheck',False):
             last_result = None
         else:
             last_result = (
@@ -1259,7 +1346,12 @@ class MapleStoryAutoBot:
         # ⚠️ 正确性保障：**第一次匹配仍允许全图**（那是唯一可能"位置真的大幅变化"
         #    的时刻，例如刚切地图、刚复活）。只有后续切块才禁用 —— 它们搜的是
         #    同一个名字的不同片段，位置必然一致，没必要各自再做一次全图。
-        _global_used = False
+        _name_now = time.monotonic()
+        _global_used = _name_now - getattr(self, "_name_global_time", -100) < .3
+        # Without an anchor, rotate whole-name and partial-name searches. Limiting
+        # every retry to the whole template would permanently starve occlusion recovery.
+        _search_index = -1
+        _search_slot = getattr(self, '_name_search_slot', 0) % sum(n for n, _ in passes)
 
         for num_splits, is_fallback in passes:
             w_split = w // num_splits
@@ -1282,20 +1374,28 @@ class MapleStoryAutoBot:
             # Match tempalte
             matches = []
             for tag_type, split in nametag_splits.items():
+                _search_index += 1
+                if last_result is None and _search_index != _search_slot:
+                    continue
                 # ★ 限流：只在**还没用过全图**时允许回退（见上方 _global_used 的说明）。
                 #   第一次之后一律禁用 —— 局部搜不到就返回局部结果，
                 #   不再为同一帧的其它切块付 20ms 的全图代价。
+                if _global_used and split["last_result"] is None:
+                    continue
+                _allow_global = not _global_used
                 loc, score, is_cached = find_pattern_sqdiff(
                     img_roi,
                     split["img"],
                     last_result=split["last_result"],
                     mask=split["mask"],
-                    global_threshold=self.cfg["nametag"]["global_diff_thres"],
+                    global_threshold=min(self.cfg["nametag"]["global_diff_thres"], _thres),
                     allow_global_fallback=(not _global_used)
                 )
                 # 这次实际走了全图 → 后续切块不再允许（is_cached=False 表示未命中局部缓存，
                 # 即走了全图那条路）
-                if not is_cached:
+                if not is_cached and _allow_global:
+                    self._name_global_time = _name_now
+                    if last_result is None:self._name_search_slot = _search_slot + 1
                     _global_used = True
                 w_match = split["img"].shape[1]
                 h_match = split["img"].shape[0]
@@ -1303,6 +1403,8 @@ class MapleStoryAutoBot:
                 matches.append((tag_type, loc, score, w_match, h_match,
                                 is_cached, split["offset_x"]))
 
+            if not matches:
+                continue
             # Select best match and fix offset:
             matches.sort(key=lambda x: (not x[5], x[2]))  # prefer cached, then low score
             tag_type, loc_nt, score, w_match, h_match, is_cached, offset_x = matches[0]
@@ -1319,10 +1421,25 @@ class MapleStoryAutoBot:
                 break                        # 整块够了就别用更弱的切块
 
         tag_type, loc_nametag, score, w_match, h_match, is_cached, used_fallback = \
-            _accepted or _best_try
+            _accepted or _best_try or ("deferred", self.loc_nametag, float("inf"), w, h, False, False)
+
+        recovered=False
+        if _accepted is None and self.nametag_ever_hit and not getattr(self,'_force_name_recheck',False):
+            from src.utils.nametag_recovery import recover_nearby_name
+            candidate=recover_nearby_name(img_camera,self.img_nametag_gray,mask,self.loc_nametag)
+            previous=getattr(self,'_nametag_recovery_candidate',None)
+            if candidate:
+                point,recovery_score=candidate
+                consistent=previous is not None and max(abs(point[i]-previous[i]) for i in (0,1))<=8
+                self._nametag_recovery_candidate=point
+                if consistent:
+                    loc_nametag=point;score=recovery_score;recovered=True
+            else:self._nametag_recovery_candidate=None
+        else:self._nametag_recovery_candidate=None
 
         # Only update nametag location when score is good enough
-        if score < self.cfg["nametag"]["diff_thres"]:
+        if score < self.cfg["nametag"]["diff_thres"] or recovered:
+            self._strict_name_hit=not recovered
             self.loc_nametag = loc_nametag
             self.nametag_miss_streak = 0
             self.nametag_hit = True
@@ -1334,6 +1451,7 @@ class MapleStoryAutoBot:
                     f"{self.loc_nametag[1] - self.cfg['nametag']['offset'][1]})"
                     f"，score={score:.4f}")
         else:
+            self._strict_name_hit=False
             # 匹配失败：loc_nametag 保持上一帧的值 —— 位置会被「冻住」。
             # 这里只累加计数，告警交给主循环（那边才知道要不要按帧刷屏）。
             self.nametag_miss_streak += 1
@@ -1562,11 +1680,11 @@ class MapleStoryAutoBot:
         '''
         if self.cfg["bot"]["attack"] == "aoe_skill":
             dx = self.cfg["aoe_skill"]["range_x"] // 2
-            dy = self.cfg["aoe_skill"]["range_y"] // 2
+            up, down = vertical_reach(self.cfg["aoe_skill"])
             x0 = max(0, self.loc_player[0] - dx)
             x1 = min(self.img_frame.shape[1], self.loc_player[0] + dx)
-            y0 = max(0, self.loc_player[1] - dy)
-            y1 = min(self.img_frame.shape[0], self.loc_player[1] + dy)
+            y0 = max(0, self.loc_player[1] - up)
+            y1 = min(self.img_frame.shape[0], self.loc_player[1] + down)
 
         elif self.cfg["bot"]["attack"] == "directional":
             if is_left:
@@ -1575,8 +1693,9 @@ class MapleStoryAutoBot:
             else:
                 x0 = self.loc_player[0]
                 x1 = x0 + self.cfg["directional_attack"]["range_x"]
-            y0 = self.loc_player[1] - self.cfg["directional_attack"]["range_y"] // 2
-            y1 = y0 + self.cfg["directional_attack"]["range_y"]
+            up, down = vertical_reach(self.cfg["directional_attack"])
+            y0 = max(0, self.loc_player[1] - up)
+            y1 = min(self.img_frame.shape[0], self.loc_player[1] + down)
         else:
             raise RuntimeError(f"Unsupported attack mode: {self.cfg['bot']['attack']}")
 
@@ -1607,6 +1726,10 @@ class MapleStoryAutoBot:
         for monster in self.monsters:
             mx1, my1 = monster["position"]
             mw, mh = monster["size"]
+            if '_predicted_position' in monster:
+                px,py=monster['_predicted_position']
+                if min(px+mw,x1)>max(px,x0) and min(py+mh,y1)>max(py,y0):
+                    mx1,my1=px,py
             mx2 = mx1 + mw
             my2 = my1 + mh
 
@@ -1620,13 +1743,7 @@ class MapleStoryAutoBot:
             ih = max(0, iy2 - iy1)
             inter_area = iw * ih
 
-            # 取所有怪物模板中最小的面积作下限；空模板时退回 0，
-            # 避免对空序列 min() 抛 ValueError（与 with_enemy_hp_bar 处同样的埋雷）
-            _areas = [im.shape[0] * im.shape[1]
-                      for _, _imgs in self.monsters_info.items() for im, _ in _imgs]
-            min_mob_area = min(_areas) if _areas else 0
-            inter_area_thres = min(min_mob_area, self.cfg['monster_detect']['max_mob_area_trigger'])
-            if inter_area >= inter_area_thres:
+            if inter_area > 0:
                 # Compute distance to player center
                 monster_center = (mx1 + mw // 2, my1 + mh // 2)
                 dx = monster_center[0] - self.loc_player[0]
@@ -1667,8 +1784,10 @@ class MapleStoryAutoBot:
         #    而它只跟「当前画面 + 角色位置」有关、跟具体用哪个模板**完全无关**
         #    → 提出来是**纯赚**：结果一模一样，只是少算十几遍。
         _mode = self.cfg["monster_detect"]["mode"]
+        threshold=self.cfg['monster_detect'].get('effective_diff_thres',self.cfg['monster_detect']['diff_thres'])
         _blur = self.cfg["monster_detect"]["contour_blur"]
         _roi_blur = None
+        roi_gray=cv2.cvtColor(img_roi,cv2.COLOR_BGR2GRAY) if _mode=="grayscale" else None
         if _mode == "contour_only":
             _mask_roi = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
             # Zero out mask inside this region (ignore player's own character)
@@ -1677,6 +1796,9 @@ class MapleStoryAutoBot:
 
         for monster_name, monster_imgs in self.monsters_info.items():
             for img_monster, mask_monster in monster_imgs:
+                if getattr(self,"detection_yield",0):time.sleep(self.detection_yield)
+                if img_monster.shape[0]>img_roi.shape[0] or img_monster.shape[1]>img_roi.shape[1]:
+                    continue
                 if _mode == "contour_only":
                     # Use only black lines contour to detect monsters
                     # Create masks (already grayscale)
@@ -1698,31 +1820,31 @@ class MapleStoryAutoBot:
                     res = cv2.matchTemplate(img_roi_blur, img_monster_blur, cv2.TM_SQDIFF_NORMED)
 
                     # Apply soft threshold
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    match_locations = np.where(res <= threshold)
 
                     h, w = img_monster.shape[:2]
                     for pt in zip(*match_locations[::-1]):
                         monsters.append({
                             "name": monster_name,
                             "position": (pt[0] + x0, pt[1] + y0),
-                            "size": (h, w),
+                            "size": (w, h),
                             "score": res[pt[1], pt[0]],
                         })
                 elif self.cfg["monster_detect"]["mode"] == "grayscale":
                     img_monster_gray = cv2.cvtColor(img_monster, cv2.COLOR_BGR2GRAY)
-                    img_roi_gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
+                    img_roi_gray = roi_gray
                     res = cv2.matchTemplate(
                             img_roi_gray,
                             img_monster_gray,
                             cv2.TM_SQDIFF_NORMED,
                             mask=mask_monster)
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    match_locations = np.where(res <= threshold)
                     h, w = img_monster.shape[:2]
                     for pt in zip(*match_locations[::-1]):
                         monsters.append({
                             "name": monster_name,
                             "position": (pt[0] + x0, pt[1] + y0),
-                            "size": (h, w),
+                            "size": (w, h),
                             "score": res[pt[1], pt[0]],
                     })
                 elif self.cfg["monster_detect"]["mode"] == "color":
@@ -1731,13 +1853,13 @@ class MapleStoryAutoBot:
                             img_monster,
                             cv2.TM_SQDIFF_NORMED,
                             mask=mask_monster)
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    match_locations = np.where(res <= threshold)
                     h, w = img_monster.shape[:2]
                     for pt in zip(*match_locations[::-1]):
                         monsters.append({
                             "name": monster_name,
                             "position": (pt[0] + x0, pt[1] + y0),
-                            "size": (h, w),
+                            "size": (w, h),
                             "score": res[pt[1], pt[0]],
                     })
                 else:
@@ -1778,7 +1900,7 @@ class MapleStoryAutoBot:
                 monsters.append({
                     "name": "Health Bar",
                     "position": (x0 + x, y0 + y),
-                    "size": (h, w),
+                    "size": (w, h),
                     "score": 1.0,
                 })
 
@@ -2200,29 +2322,7 @@ class MapleStoryAutoBot:
         #    后者，画框不会污染任何颜色/模板判据（见 run_once 里的同款注释）。
         if self.img_frame_debug is not None and \
                 (self.cfg.get("monster_detect", {}) or {}).get("draw_mob_boxes", False):
-            # getattr 兜底：离线用例里的 Stub 不走 __init__，可能没有这个属性
-            for _mk in (getattr(self, "monsters", None) or []):
-                try:
-                    _mx, _my = _mk["position"]
-                    _mw, _mh = _mk["size"]
-                    # 尺寸防御：模板尺寸异常时不画（画出来是个巨型框，更迷惑）
-                    if not (0 < _mw < self.img_frame_debug.shape[1] and
-                            0 < _mh < self.img_frame_debug.shape[0]):
-                        continue
-                    _is_hp = (_mk.get("name") == "Health Bar")
-                    # 黄 = 血条检出，绿 = 模板检出（沿用上游原版的配色约定）
-                    _color = (0, 255, 255) if _is_hp else (0, 255, 0)
-                    # 不写文字：中文标签要过 PIL（实测 ≈0.1ms/次），
-                    # 误报多时一帧几十个框会明显拖帧。框本身（cv2.rectangle）
-                    # 只改几十个像素，开销可忽略 —— 所以只画框、不写字。
-                    cv2.rectangle(
-                        self.img_frame_debug,
-                        (max(0, _mx), max(0, _my)),
-                        (max(0, _mx + _mw), max(0, _my + _mh)),
-                        _color, 2)
-                except Exception:                            # noqa: BLE001
-                    # 画框是纯观测，绝不允许把主循环带崩（同 _perf 的纪律）
-                    continue
+            pass  # Monster boxes are drawn once by draw_visible_monsters.
 
         # ── 索敌范围框（2026-09-29 从怪检测内部挪到这里，治闪烁）──────────────
         # 治的是用户「识别框疯狂闪烁」——原来它画在 get_monsters_in_range 里，
@@ -2245,15 +2345,15 @@ class MapleStoryAutoBot:
                 _margin = _md["search_box_margin"]
                 if self.cfg["bot"]["attack"] == "aoe_skill":
                     _dx = self.cfg["aoe_skill"]["range_x"] // 2 + _margin
-                    _dy = self.cfg["aoe_skill"]["range_y"] // 2 + _margin
+                    _up, _down = vertical_reach(self.cfg["aoe_skill"])
                 else:
                     _dx = self.cfg["directional_attack"]["range_x"] + _margin
-                    _dy = self.cfg["directional_attack"]["range_y"] + _margin
+                    _up, _down = vertical_reach(self.cfg["directional_attack"])
                 _h_f, _w_f = self.img_frame_debug.shape[:2]
                 _sx0 = max(0, self.loc_player[0] - _dx)
                 _sx1 = min(_w_f, self.loc_player[0] + _dx)
-                _sy0 = max(0, self.loc_player[1] - _dy)
-                _sy1 = min(_h_f, self.loc_player[1] + _dy)
+                _sy0 = max(0, self.loc_player[1] - _up - _margin)
+                _sy1 = min(_h_f, self.loc_player[1] + _down + _margin)
                 cv2.rectangle(self.img_frame_debug,
                               (_sx0, _sy0), (_sx1, _sy1), (255, 0, 0), 2)
             except Exception:                                # noqa: BLE001
@@ -2318,6 +2418,16 @@ class MapleStoryAutoBot:
         '''
         terminate all threads
         '''
+        self.is_terminated = True
+        with self._detection_lock:
+            worker=getattr(self,'_visible_worker',None)
+            if worker is not None:
+                worker.close();self._visible_worker=None
+            survey=getattr(self,'_survey_worker',None)
+            if survey is not None:
+                survey.close();self._survey_worker=None
+            trace=getattr(self,'_detection_trace',None)
+            if trace is not None:trace.close();self._detection_trace=None
         # Terminate keyboard controller
         if self.kb is not None:
             self.kb.is_terminated = True
@@ -4368,23 +4478,373 @@ class MapleStoryAutoBot:
             f"指令({self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
             + (f"，距上次 {gap:.2f}s" if gap is not None else ""))
 
+    def update_visible_hunt(self,now):
+        from src.navigation.mob_hunt import project_monsters,choose_target,route_to
+        nav=self.graph_navigator;nav.random_patrol=True
+        if getattr(nav,'platform_sweep',None) is not None:return
+        if not getattr(self,'graph_position_valid',False) or not getattr(self,'nametag_hit',False):
+            # Keep the selected route during a temporary localization loss.
+            return
+        if nav.transit or nav.fault or getattr(self,'_combat_hold',False):return
+        here=nav.locate(self.loc_player_global)
+        if not here:return
+        locked=nav.hunt_target
+        if locked and (here!=locked['platform'] or abs(self.loc_player_global[0]-locked['x'])>1):
+            route=route_to(nav.graph,here,self.loc_player_global,locked)
+            if route is not None:
+                if not nav.path:nav.path=route[1];nav.goal=locked['platform'];nav.aim=None
+                self._hunt_empty_scans=0
+                return
+            logger.info(f"[目标锁定] {locked['platform']} 已无可达路线，解除锁定")
+            nav.hunt_target=None;nav.path=[];nav.goal=None;nav.aim=None;locked=None
+        calibration=nav.graph.get('hunt_calibration')
+        if not calibration or calibration.get('frame_size')!=[self.img_frame.shape[1],self.img_frame.shape[0]]:
+            if not getattr(self,'_hunt_calibration_notice',False):
+                logger.info('[全屏找怪] 请在地图校验中校准画面坐标；当前先随机巡逻，沿途清怪。')
+                self._hunt_calibration_notice=True
+            nav.hunt_target=None;return
+        MapleStoryAutoBot.refresh_visible_monsters(self, now)
+        scan_time=self._visible_scan_time
+        if now-getattr(self,'_visible_source_time',-100)>0.9:return
+        if scan_time == getattr(self,'_hunt_scan_time',None):return
+        self._hunt_scan_time=scan_time
+        detected=self.visible_monsters
+        anchor=getattr(self,'_visible_anchor',(self.loc_player,self.loc_player_global,True))
+        if not anchor[2]:return
+        targets=project_monsters(detected,anchor[0],anchor[1],nav.graph,self.img_frame.shape)
+        if locked:
+            targets=[t for t in targets if t['platform']==locked['platform']]
+        memory=getattr(self,'_mob_memory',None)
+        if memory and not locked:
+            targets+=list(memory.targets.values())
+        chosen=choose_target(nav.graph,here,self.loc_player_global,targets,nav.hunt_target)
+        if chosen:
+            cost,target,path=chosen;self._hunt_empty_scans=0
+            previous=nav.hunt_target
+            nav.hunt_target=target
+            if previous is None or previous['platform']!=target['platform'] or abs(previous['x']-target['x'])>3:
+                nav.path=path;nav.goal=target['platform'];nav.aim=None
+                logger.info(f"[全屏找怪] 目标 {target['platform']} x={target['x']:.1f}，路径代价 {cost:.1f}，经过 {len(path)} 条连接")
+        else:
+            if locked:
+                # Do not infer an empty destination from a scan taken en route
+                # or a near-player crop that doesn't cover the target location.
+                if abs(self.loc_player_global[0]-locked['x'])>1:return
+                region=getattr(self,'_visible_region',None)
+                if region is not None:
+                    c=calibration
+                    px,py=[anchor[0][i]+(locked[k]-anchor[1][i]-c['offset'][i])*c['scale'][i]
+                           for i,k in enumerate(('x','y'))]
+                    if not(region[0]<=px<=region[2] and region[1]<=py<=region[3]):return
+            self._hunt_empty_scans=getattr(self,'_hunt_empty_scans',0)+1
+            if self._hunt_empty_scans>=3 and nav.hunt_target:
+                nav.hunt_target=None;nav.path=[];nav.goal=None;nav.aim=None
+                logger.info('[全屏找怪] 连续未发现可达目标，恢复随机巡逻')
+
+    def refresh_visible_monsters(self, now):
+        import threading
+        if not hasattr(self,'_detection_lock'):self._detection_lock=threading.RLock()
+        with self._detection_lock:
+            if getattr(self,'is_terminated',False):return
+            return MapleStoryAutoBot._refresh_visible_monsters(self,now)
+
+    def _refresh_visible_monsters(self, now):
+        """Poll completed work and submit one immutable frame without blocking."""
+        from src.utils.latest_detection import LatestDetection
+        from types import SimpleNamespace
+        from src.navigation.mob_memory import PlatformMobMemory
+        from src.navigation.mob_hunt import project_monsters,route_to
+        nav=getattr(self,'graph_navigator',None)
+        from src.utils.monster_batches import MonsterBatches
+        if getattr(self,'_monster_batches',None) is None:self._monster_batches=MonsterBatches()
+        from src.utils.monster_tracks import MonsterTracks
+        if getattr(self,'_monster_tracks',None) is None:self._monster_tracks=MonsterTracks(2.5)
+        if self.cfg.get('diagnostics',{}).get('detection_trace',False) and getattr(self,'_detection_trace',None) is None:
+            from src.utils.detection_trace import DetectionTrace
+            self._detection_trace=DetectionTrace(resource_path('debug/detection_traces'),180)
+            logger.info(f'[识别诊断] 开始记录 180 秒，目录：{self._detection_trace.folder}')
+        valid=getattr(self,'graph_position_valid',False) and getattr(self,'nametag_hit',False)
+        here=nav.locate(self.loc_player_global) if nav and valid and not nav.transit else None
+        if getattr(self,'_mob_memory',None) is None:self._mob_memory=PlatformMobMemory()
+        memory=self._mob_memory
+        memory.arrive(here)
+        if here:
+            memory.targets={pid:t for pid,t in memory.targets.items() if route_to(nav.graph,here,self.loc_player_global,t)}
+        if getattr(self,'_visible_worker',None) is None:self._visible_worker=LatestDetection()
+        if getattr(self,'_survey_worker',None) is None:self._survey_worker=LatestDetection()
+        for worker in (self._visible_worker,self._survey_worker):
+            try:
+                result=worker.poll()
+            except Exception as error:
+                logger.warning(f'[怪物检测] 后台检测失败，等待下一帧重试：{error}')
+                self._survey_status=f'检测失败：{error}'
+                result=None
+            if result is not None:
+                detected,source,elapsed,anchor,shape,region=result
+                if region is not None:
+                    damage=getattr(self,'_damage_response',None)
+                    if damage is not None:
+                        outcome=damage.complete(getattr(self,'_near_damage_batch',None),bool(detected),
+                            shape==self.img_frame.shape and anchor[2] and now-source<=.9)
+                        if outcome:
+                            logger.info('[受伤排查] '+('已识别到怪物，交给正常攻击判断' if outcome=='found' else
+                                '全部怪物类型及动作素材已检查，仍未匹配；可能是遮挡、素材漏检或其它伤害来源'))
+                if region is None:
+                    self._survey_scan_ms=elapsed
+                    if shape==self.img_frame.shape and now-source<=10:
+                        self._monster_batches.observe(detected,now)
+                    self._survey_status=('结果尺寸变化，已丢弃' if shape!=self.img_frame.shape else
+                        '人物定位无效，未更新优先级' if not anchor[2] else
+                        '结果过期，未更新优先级' if now-source>.9 else
+                        '缺少地图坐标校准' if not nav or not nav.graph.get('hunt_calibration') else
+                        f'已完成：识别 {len(detected)} 只怪物，耗时 {elapsed:.0f} ms')
+                if shape==self.img_frame.shape:
+                    if region is not None:
+                        calibration=nav.graph.get('hunt_calibration') if nav and getattr(self,'graph_position_valid',False) else None
+                        if now-source<=.9:
+                            self._monster_tracks.update(detected,source,anchor,calibration)
+                            held=self._monster_tracks.candidates(source,anchor,calibration)
+                            # Brief attack continuity, longer local reacquisition.
+                            # Only real matches refresh the per-monster deadline.
+                            grace=.8 if getattr(self,'cmd_action','none')=='attack' else .45
+                            detected=detected+[dict(m,tracking_pending=True) for m in held if 0<m['track_age'] and m['track_age']+now-source<=grace]
+                        self.visible_monsters=detected;self._visible_scan_ms=elapsed
+                        self._visible_scan_peak_ms=max(getattr(self,"_visible_scan_peak_ms",0.),elapsed)
+                        self._visible_scan_time=source;self._visible_source_time=source
+                        self._visible_anchor=anchor
+                        self._visible_region=region
+                    if nav and anchor[2] and getattr(self,'graph_position_valid',False):
+                        targets=project_monsters(detected,anchor[0],anchor[1],nav.graph,shape)
+                        if region is None and getattr(nav,'platform_sweep',None) and now-source<=.9:
+                            c=nav.graph.get('hunt_calibration');visible=[];in_view=[]
+                            if c and c['frame_size']==[shape[1],shape[0]]:
+                                from src.navigation.map_graph import platform_y
+                                for p in nav.graph['platforms']:
+                                    points=[(x,platform_y(p,x)) for x in (p['x1'],p['x2'])]
+                                    screen=[tuple(anchor[0][i]+(point[i]-anchor[1][i]-c['offset'][i])*c['scale'][i] for i in (0,1)) for point in points]
+                                    if (max(x for x,y in screen)>=0 and min(x for x,y in screen)<shape[1]
+                                        and max(y for x,y in screen)>=0 and min(y for x,y in screen)<self.cfg['ui_coords']['ui_y_start']):in_view.append(p['id'])
+                                    if all(40<x<shape[1]-40 and 100<y<self.cfg['ui_coords']['ui_y_start']-40 for x,y in screen):visible.append(p['id'])
+                                nav.platform_sweep.observe(targets,source,visible,in_view)
+                                logger.info(f'[全屏平台计数] {nav.platform_sweep.counts}；当前平台 {here}；目标 {nav.platform_sweep.target}')
+                        if region is None:memory.remember(targets,here or memory.current)
+                        else:
+                            # A fresh near scan can invalidate a cached target cleared from another platform.
+                            calibration=nav.graph.get('hunt_calibration')
+                            if calibration:
+                                seen={t['platform'] for t in targets}
+                                for pid,target in list(memory.targets.items()):
+                                    x,y=[anchor[0][i]+(target[k]-anchor[1][i]-calibration['offset'][i])*calibration['scale'][i]
+                                         for i,k in enumerate(('x','y'))]
+                                    x0,y0,x1,y1=region
+                                    if x0+40<x<x1-40 and y0+40<y<y1-40 and pid not in seen:
+                                        memory.targets.pop(pid,None)
+        if self._visible_worker.future is not None or now-getattr(self,'_visible_submit_time',-100)<0.03:return
+        snapshot=SimpleNamespace(img_frame=self.img_frame.copy(),cfg=self.cfg,
+            detection_trace=getattr(self,'_detection_trace',None),
+            monsters_info=self.monsters_info,loc_player=tuple(self.loc_player),
+            loc_player_global=tuple(getattr(self,'loc_player_global',(0,0))),
+            graph_position_valid=getattr(self,'graph_position_valid',False),
+            nametag_hit=getattr(self,'nametag_hit',False),
+            player_reference_valid=getattr(self,'_player_reference_reliable',
+                getattr(self,'nametag_hit',False) or getattr(self,'nametag_ever_hit',False)),
+            img_minimap=getattr(self,'img_minimap',None),loc_minimap=getattr(self,'loc_minimap',None))
+        region=None
+        sweep_mode=bool(nav and getattr(nav,'platform_sweep',None))
+        full_due=(now-memory.last_survey>=10) if sweep_mode else (
+            memory.needs_survey(now) and not getattr(self,'_combat_hold',False))
+        mode=self.cfg.get('bot',{}).get('attack')
+        skill=self.cfg.get('aoe_skill' if mode=='aoe_skill' else 'directional_attack',{})
+        if skill:
+            up,down=vertical_reach(skill)
+            margin=self.cfg.get('monster_detect',{}).get('search_box_margin',50)
+            dx=skill['range_x']//2 if mode=='aoe_skill' else skill['range_x']
+            h,w=self.img_frame.shape[:2];px,py=self.loc_player
+            region=(max(0,px-dx-margin),max(0,py-up-margin),min(w,px+dx+margin),min(h,py+down+margin))
+        snapshot.scan_region=region
+        snapshot.all_monsters_info=self.monsters_info
+        calibration=nav.graph.get('hunt_calibration') if nav and snapshot.graph_position_valid else None
+        track_anchor=(snapshot.loc_player,snapshot.loc_player_global,snapshot.player_reference_valid)
+        snapshot.tracking_boxes=self._monster_tracks.candidates(now,track_anchor,calibration)[:3]
+        if getattr(self,'cmd_action','none')=='attack':self._name_attack_until=now+1
+        snapshot.name_tracking_attack=now<getattr(self,'_name_attack_until',0)
+        snapshot.name_attack_ranges=([self.get_attack_range(is_left=side) for side in (True,False)]
+                                     if snapshot.name_tracking_attack else [])
+        snapshot.tracking_boxes=[dict(m,name_attack_eligible=
+            MapleStoryAutoBot.monster_overlaps_attack(self,m)) for m in snapshot.tracking_boxes]
+        snapshot.monsters_info=self._monster_batches.select(self.monsters_info,now)
+        self._near_damage_batch=None
+        damage=getattr(self,'_damage_response',None)
+        if damage is not None and damage.pending:
+            if MapleStoryAutoBot.current_visible_monsters(self,now):
+                damage.complete(None,True)
+            else:
+                request=damage.batch(self.monsters_info)
+                if request is not None:
+                    snapshot.monsters_info,self._near_damage_batch=request
+                    snapshot.tracking_boxes=[]
+                    logger.info(f'[受伤排查] 优先检测 {next(iter(snapshot.monsters_info))}，本批 {sum(map(len,snapshot.monsters_info.values()))} 张素材')
+        source=getattr(self,'_frame_source_time',now)
+        if self._visible_worker.submit(MapleStoryAutoBot.scan_visible_snapshot,snapshot,source):
+            self._visible_submit_time=now
+        if full_due and self._survey_worker.future is None:
+            survey=SimpleNamespace(**vars(snapshot));survey.scan_region=None;survey.detection_yield=.005
+            survey.monsters_info=self.monsters_info;survey.tracking_boxes=[]
+            if self._survey_worker.submit(MapleStoryAutoBot.scan_visible_snapshot,survey,source):
+                memory.last_survey=now;self._survey_status='全视野检测中（近身独立运行）'
+
+    @staticmethod
+    def scan_visible_snapshot(snapshot, source):
+        started=time.perf_counter()
+        h,w=snapshot.img_frame.shape[:2]
+        region=getattr(snapshot,'scan_region',None)
+        x0,y0,x1,y1=region or (0,0,w,h)
+        detected=MapleStoryAutoBot.get_monsters_in_range(snapshot,(x0,y0),(x1,y1))
+        if region is not None and getattr(snapshot,'name_tracking_attack',False):
+            from src.utils.monster_name_learning import learner
+            learner.offer(snapshot.img_frame,[m for m in detected if
+                any(min(m['position'][0]+m['size'][0],r[2])>max(m['position'][0],r[0]) and
+                    min(m['position'][1]+m['size'][1],r[3])>max(m['position'][1],r[1])
+                    for r in getattr(snapshot,'name_attack_ranges',[]))],source)
+        # Recheck known monsters on this NEW frame, using all their animation
+        # poses only in a small neighborhood. Never retain an unverified old box.
+        if region is not None:
+            from types import SimpleNamespace
+            for previous in getattr(snapshot,'tracking_boxes',[]):
+                from src.utils.monster_names import confirm_name
+                named=confirm_name(snapshot.img_frame,previous,source,
+                    getattr(snapshot,'name_tracking_attack',False) and previous.get('name_attack_eligible',False))
+                if named is not None:
+                    # Prefer the label-confirmed box; avoid rechecking every pose here.
+                    detected=[m for m in detected if not (m['name']==named['name'] and
+                        abs(m['position'][0]-named['position'][0])<24 and
+                        abs(m['position'][1]-named['position'][1])<24)]
+                    detected.append(named)
+                    continue
+                name=previous['name'];templates=getattr(snapshot,'all_monsters_info',{}).get(name,[])
+                if not templates:continue
+                x,y=previous['position'];mw,mh=previous['size']
+                left=max(0,int(x)-24);top=max(0,int(y)-24)
+                right=min(w,int(x+mw)+24);bottom=min(h,int(y+mh)+24)
+                local=SimpleNamespace(**vars(snapshot));local.monsters_info={name:templates}
+                if right>left and bottom>top:
+                    detected.extend(MapleStoryAutoBot.get_monsters_in_range(local,(left,top),(right,bottom)))
+            detected=nms(detected,iou_threshold=.4)
+        minimap=snapshot.img_minimap
+        if minimap is not None and snapshot.loc_minimap is not None:
+            mx,my=snapshot.loc_minimap;mh,mw=minimap.shape[:2]
+            detected=[m for m in detected if not (
+                mx<=m['position'][0]+m['size'][0]/2<=mx+mw and
+                my<=m['position'][1]+m['size'][1]/2<=my+mh)]
+        elapsed=(time.perf_counter()-started)*1000
+        trace=getattr(snapshot,'detection_trace',None)
+        if trace is not None:
+            trace.record('near' if region is not None else 'survey',snapshot.img_frame,dict(
+                source_monotonic=source,elapsed_ms=elapsed,region=region,
+                map=snapshot.cfg.get('bot',{}).get('map'),
+                threshold=snapshot.cfg['monster_detect'].get('effective_diff_thres',snapshot.cfg['monster_detect']['diff_thres']),
+                mode=snapshot.cfg['monster_detect']['mode'],
+                templates={k:len(v) for k,v in snapshot.monsters_info.items()},
+                tracking_boxes=len(getattr(snapshot,'tracking_boxes',[])),
+                player=snapshot.loc_player,global_position=snapshot.loc_player_global,
+                name_hit=snapshot.nametag_hit,map_valid=snapshot.graph_position_valid,
+                player_reference_valid=getattr(snapshot,'player_reference_valid',False),detections=detected))
+        return (detected,source,elapsed,
+                (snapshot.loc_player,snapshot.loc_player_global,(snapshot.graph_position_valid or region is not None) and
+                 getattr(snapshot,'player_reference_valid',snapshot.nametag_hit)),
+                snapshot.img_frame.shape,region)
+
+    def current_visible_monsters(self, now):
+        """Discard expired observations and compensate for camera movement."""
+        if now-getattr(self,'_visible_source_time',-100)>0.9:return []
+        anchor=getattr(self,'_visible_anchor',None)
+        if not anchor or not anchor[2]:return []
+        nav=getattr(self,'graph_navigator',None)
+        calibration=nav.graph.get('hunt_calibration') if nav else None
+        delta=[self.loc_player[i]-anchor[0][i] for i in (0,1)]
+        if calibration and getattr(self,'graph_position_valid',False):
+            delta=[delta[i]-(self.loc_player_global[i]-anchor[1][i])*calibration['scale'][i] for i in (0,1)]
+        elif max(map(abs,delta))>8:return []
+        return [dict(m,position=tuple(round(m['position'][i]+delta[i]) for i in (0,1)))
+                for m in getattr(self,'visible_monsters',[])]
+
+    def monster_overlaps_attack(self, monster):
+        """Use the same positive-area overlap rule as attack selection."""
+        x,y=monster['position'];w,h=monster['size']
+        for left in (True,False):
+            x0,y0,x1,y1=self.get_attack_range(is_left=left)
+            if min(x+w,x1)>max(x,x0) and min(y+h,y1)>max(y,y0):return True
+        return False
+
+    def monster_debug_color(self, overlaps, stale):
+        if stale:return (128,128,128)
+        if not overlaps:return (255,255,0)
+        return (0,255,0) if getattr(self,'cmd_action','none')=='attack' else (0,190,255)
+
+    def draw_visible_monsters(self):
+        """Draw cached detections every preview frame, including during combat."""
+        now=time.monotonic()
+        age=max(0,now-getattr(self,'_visible_source_time',now))
+        monsters=MapleStoryAutoBot.current_visible_monsters(self,now)
+        anchor=getattr(self,'_visible_anchor',None)
+        stale=age>0.9 or not anchor or not anchor[2]
+        if not monsters:monsters=getattr(self,'visible_monsters',[]) or []
+        overlap_count=0
+        for index,monster in enumerate(monsters,1):
+            overlaps=MapleStoryAutoBot.monster_overlaps_attack(self,monster)
+            overlap_count+=int(overlaps and not stale)
+            color=MapleStoryAutoBot.monster_debug_color(self,overlaps,stale)
+            if monster.get('tracking_pending') and not stale:color=(0,215,255)
+            x,y=map(int,monster['position']);w,h=map(int,monster['size'])
+            cv2.rectangle(self.img_frame_debug,(x,y),(x+w,y+h),color,2)
+            if monster.get('name_confirmed'):
+                nx,ny,nw,nh=map(int,monster['name_box'])
+                cv2.rectangle(self.img_frame_debug,(nx,ny),(nx+nw,ny+nh),(255,200,0),1)
+            cv2.putText(self.img_frame_debug,f'M{index}'+(' NAME' if monster.get('name_confirmed') else ' ?' if monster.get('tracking_pending') else ''),(x,max(12,y-3)),
+                        cv2.FONT_HERSHEY_SIMPLEX,.4,color,1,cv2.LINE_AA)
+        memory=getattr(self,'_mob_memory',None)
+        pending=memory.targets if memory else {}
+        nav=getattr(self,'graph_navigator',None)
+        calibration=nav.graph.get('hunt_calibration') if nav else None
+        if calibration and getattr(self,'graph_position_valid',False):
+            for pid,target in pending.items():
+                x,y=[round(self.loc_player[i]+(target[k]-self.loc_player_global[i]-calibration['offset'][i])*calibration['scale'][i])
+                     for i,k in enumerate(('x','y'))]
+                if 0<=x<self.img_frame_debug.shape[1] and 0<=y<self.img_frame_debug.shape[0]:
+                    cv2.circle(self.img_frame_debug,(x,y),9,(0,190,255),2)
+                    cv2.putText(self.img_frame_debug,f'{pid} cached',(x+12,y),cv2.FONT_HERSHEY_SIMPLEX,.45,(0,190,255),1)
+        scope='全屏普查' if getattr(self,'_visible_region',None) is None else '近身检测'
+        banner=(f'{scope} {len(monsters)} 怪 | 待访问 {len(pending)} 平台 | 检测 {getattr(self,"_visible_scan_ms",0):.0f} ms'
+                f' | 结果年龄 {age:.1f} 秒'+('（旧结果）' if stale else ''))
+        banner += f' | 实时 {getattr(self,"_latency_ms",0):.0f} / 最高 {getattr(self,"_latency_peak_ms",0):.0f} ms'
+        banner += f' | 全屏 {getattr(self,"_survey_scan_ms",0):.0f} ms'
+        if overlap_count and getattr(self,'cmd_action','none')!='attack':
+            reason=getattr(nav,'status','') or getattr(self,'_combat_status','等待攻击决策')
+            put_text_cn(self.img_frame_debug,'范围内暂缓攻击：'+reason,(10,max(20,self.img_frame_debug.shape[0]-82)),(0,190,255),font_size=16)
+        banner_y=max(0,self.img_frame_debug.shape[0]-56)
+        cv2.rectangle(self.img_frame_debug,(4,banner_y),(self.img_frame_debug.shape[1]-4,banner_y+52),(0,0,0),-1)
+        put_text_cn(self.img_frame_debug,banner,(10,banner_y+3),(255,255,0),font_size=17)
+        put_text_cn(self.img_frame_debug,'青：范围外  绿：请求攻击  橙：暂缓  黄？：短暂漏检待确认  灰：旧结果  红：攻击范围',
+                    (10,banner_y+27),(220,220,220),font_size=15)
+
     def update_cmd_by_mob_detection(self):
+        self._combat_hold=False
         # Get monster search box
         margin = self.cfg["monster_detect"]["search_box_margin"]
         if self.cfg["bot"]["attack"] == "aoe_skill":
             dx = self.cfg["aoe_skill"]["range_x"] // 2 + margin
-            dy = self.cfg["aoe_skill"]["range_y"] // 2 + margin
+            up, down = vertical_reach(self.cfg["aoe_skill"])
             cooldown = self.cfg["aoe_skill"]["cooldown"]
         elif self.cfg["bot"]["attack"] == "directional":
             dx = self.cfg["directional_attack"]["range_x"] + margin
-            dy = self.cfg["directional_attack"]["range_y"] + margin
+            up, down = vertical_reach(self.cfg["directional_attack"])
             cooldown = self.cfg["directional_attack"]["cooldown"]
         else:
             raise RuntimeError(f"Unsupported attack mode: {self.cfg['bot']['attack']}")
         x0 = max(0                      , self.loc_player[0] - dx)
         x1 = min(self.img_frame.shape[1], self.loc_player[0] + dx)
-        y0 = max(0                      , self.loc_player[1] - dy)
-        y1 = min(self.img_frame.shape[0], self.loc_player[1] + dy)
+        y0 = max(0                      , self.loc_player[1] - up - margin)
+        y1 = min(self.img_frame.shape[0], self.loc_player[1] + down + margin)
 
         # Get monsters in the search box
         _perf_t0 = time.perf_counter()
@@ -4397,10 +4857,29 @@ class MapleStoryAutoBot:
         # ⚠️ 跳过的帧**不调 _perf**：否则耗时被摊到更多帧上，日志里的
         #    "怪检测 XXXms" 会假性变小（502 → 251），让人误以为优化生效，
         #    把后续排查彻底带偏。它应该始终显示"跑一次要多久"。
+        _mob_fresh=False
+        shared=getattr(self,'graph_navigator',None) is not None
+        # Keep the attack request asserted; the keyboard worker owns skill cooldown.
+        # Clearing it on alternate vision frames can starve that worker's next tick.
+        if shared:cooldown=-1.
         _iv = monster_detect_interval(self.cfg)
         _skip = int(getattr(self, "_mob_skip", 0)) + 1
-        if _iv <= 1 or _skip >= _iv:
+        if shared:
+            MapleStoryAutoBot.refresh_visible_monsters(self,time.monotonic())
+            self.monsters=[m for m in MapleStoryAutoBot.current_visible_monsters(self,time.monotonic())
+                           if m['position'][0]<x1 and m['position'][0]+m['size'][0]>x0
+                           and m['position'][1]<y1 and m['position'][1]+m['size'][1]>y0]
+            stamp=getattr(self,'_visible_scan_time',-100)
+            from src.utils.attack_prediction import AttackPrediction
+            if not hasattr(self,'_attack_prediction'):self._attack_prediction=AttackPrediction()
+            self.monsters=self._attack_prediction.update(self.monsters,self.loc_player,stamp,time.monotonic(),
+                getattr(self,'_player_reference_reliable',False) and getattr(self,'nametag_hit',False) and
+                not getattr(self.graph_navigator,'transit',None))
+            _mob_fresh=stamp!=getattr(self,'_combat_scan_time',stamp)
+            self._combat_scan_time=stamp
+        elif _iv <= 1 or _skip >= _iv:
             self.monsters = self.get_monsters_in_range((x0, y0), (x1, y1))
+            _mob_fresh=True
             self._perf("怪检测", _perf_t0)
             self._mob_skip = 0
         else:
@@ -4417,6 +4896,60 @@ class MapleStoryAutoBot:
         # ⚠️ 配套的出口在 update_cmd_by_route：回正线**一帧像素都找不到**时立刻
         #    退出回正状态（is_using_home_route=False），否则会「既不走也不打」。
         if self.is_using_home_route:
+            return
+
+        # Stop patrol for attackable targets, then verify several fresh empty detections.
+        from src.states.combat_hold import CombatHold
+        if not hasattr(self,'_combat_tracker'):self._combat_tracker=CombatHold()
+        attackable=(self.get_nearest_monster(is_left=True) is not None or
+                    self.get_nearest_monster(is_left=False) is not None)
+        sent=getattr(getattr(self,'kb',None),'n_attack_sent',None)
+        from src.utils.player_tracking import AttackRecheck
+        if not hasattr(self,'_attack_recheck'):self._attack_recheck=AttackRecheck()
+        target=self.get_nearest_monster(True) or self.get_nearest_monster(False)
+        combat_now=time.monotonic()
+        if attackable:self._last_attackable_time=combat_now
+        recheck=self._attack_recheck.update(target['position'] if target else None,
+            combat_now,sent or 0,getattr(self,'_strict_name_hit',False))
+        if recheck and not getattr(self,'_force_name_recheck',False):
+            logger.info('[攻击校正] 同一目标持续存在，暂停出招并重新全屏定位人物')
+        elif not recheck and getattr(self,'_force_name_recheck',False):
+            logger.info('[攻击校正] 人物位置已重新确认，按更新后的攻击框判断目标')
+        self._force_name_recheck=recheck
+        if recheck:
+            self._combat_hold=combat_now-self._attack_recheck.pending_since<1.5
+            self.cmd_move_x=self.cmd_move_y=self.cmd_action='none'
+            self._combat_status='持续目标未消失，重新校正人物位置后再攻击'
+            return
+        if attackable and not self._combat_tracker.active:
+            self._combat_attack_start=sent or 0
+        burst_pending=(sent is not None and self._combat_tracker.active and
+                       sent-getattr(self,'_combat_attack_start',sent)<3)
+        can_stop=not self.is_on_ladder and self.cmd_action not in ('jump','teleport')
+        self._combat_hold=self._combat_tracker.update(attackable or burst_pending,_mob_fresh,combat_now) if can_stop else False
+        if self._combat_hold:
+            self.cmd_move_x=self.cmd_move_y=self.cmd_action='none'
+            status='交战中：停下攻击' if attackable else '等待确认附近无怪'
+        else:
+            status='附近无可攻击目标，继续巡逻'
+            self._combat_face=None
+        if status!=getattr(self,'_combat_status',None):
+            logger.info('[清怪] '+status);self._combat_status=status
+        if not attackable:
+            reference_ok=getattr(self,'_player_reference_reliable',False)
+            brief_gap=(shared and reference_ok and self._combat_hold and
+                       self.cfg['bot']['attack']=='aoe_skill' and
+                       combat_now-getattr(self,'_last_attackable_time',-100)<.6)
+            if brief_gap:
+                self._combat_status='连续施法：短暂漏检，等待新检测结果'
+                self.cmd_action='attack';self.t_last_attack=time.time()
+                return
+            if self._combat_hold and burst_pending:
+                self._combat_status='交战中：完成至少三次技能施放'
+                if time.time()-self.t_last_attack>=cooldown:
+                    self.cmd_action='attack';self.t_last_attack=time.time()
+                return
+            if self.cmd_action=='attack':self.cmd_action='none'
             return
 
         # Check if no mob to attack
@@ -4441,8 +4974,14 @@ class MapleStoryAutoBot:
                 # ⚠️ 梯子上不抢方向键（见下方 directional 分支的说明）。
                 if not self.is_on_ladder:
                     face = self.get_face_direction()
-                    if face is not None and self.cmd_move_x_last != face:
+                    old_face=getattr(self,'_combat_face',None)
+                    if self._combat_hold and old_face in ('left','right') and face!=old_face:
+                        old_target=self.get_nearest_monster(is_left=old_face=='left')
+                        if old_target is not None:face=old_face
+                    if face is not None and (getattr(self,'_combat_face',None) if self._combat_hold else self.cmd_move_x_last) != face:
                         self.cmd_move_x = face
+                        self._combat_face=face
+                        if self._combat_hold:return
                 self.cmd_action = "attack"
                 self.t_last_attack = time.time()
 
@@ -4516,7 +5055,7 @@ class MapleStoryAutoBot:
                 # ⚠️ 保留原有的"朝向不对 ⇒ 起转"语义：_turn_left <= 0 时照旧。
                 _turn_dir = getattr(self, "_turn_dir", None)
                 if _turn_left <= 0:
-                    if self.cmd_move_x_last != attack_direction:
+                    if ((getattr(self,'_combat_face',None) or self.cmd_move_x_last) if self._combat_hold else self.cmd_move_x_last) != attack_direction:
                         _turn_left = max(1, _turn_frames)
                         self._turn_dir = attack_direction
                     elif _turn_dir != attack_direction:
@@ -4526,13 +5065,15 @@ class MapleStoryAutoBot:
                     # 转身进行中且目标换边：不改计时，只记下"转完打哪边"
                     self._turn_pending_dir = attack_direction
                 if _turn_left > 0:
-                    self.cmd_move_x = attack_direction
+                    self.cmd_move_x = self._turn_dir
                     self._turn_frames_left = _turn_left - 1
+                    if self._turn_frames_left==0:self._combat_face=self._turn_dir
                     logger.debug(
                         f"[转向] 目标在{attack_direction}侧，按住方向键转身"
                         f"（还剩 {self._turn_frames_left} 帧，本帧不出招）")
                     return
                 self._turn_frames_left = 0
+                self._combat_face=self._turn_dir
                 # 朝向已就位 → 松开方向键再出招（用户要的「回头打一下就继续走」：
                 # 出招后本函数不再改 cmd_move_x，下一帧由路线接管，角色继续巡逻）
                 # ⚠️ 若转身期间目标换过边，把"最新方向"落到 _turn_dir，
@@ -4650,11 +5191,16 @@ class MapleStoryAutoBot:
         _perf_t0 = time.perf_counter()
         img_frame = self.get_img_frame()
         self._perf("抓帧", _perf_t0)
+        if self.graph_navigator is not None and (img_frame is None or
+                time.monotonic()-getattr(self.capture, 'frame_time', 0)>0.5):
+            self.kb.set_command('none none none')
+            return -1
         if img_frame is None:
             activate_game_window(self.capture.window_title)
             return -1 # Wait for game window to be ready
         else:
             self.img_frame = img_frame
+            self._frame_source_time=getattr(self.capture,'frame_time',time.monotonic())
 
         # Grayscale game window
         self.img_frame_gray = cv2.cvtColor(self.img_frame, cv2.COLOR_BGR2GRAY)
@@ -4682,6 +5228,10 @@ class MapleStoryAutoBot:
         _perf_t0 = time.perf_counter()
         minimap_result = get_minimap_loc_size(self.img_frame)
         self._perf("小地图定位", _perf_t0)
+        if self.graph_navigator is not None and minimap_result is None:
+            self.graph_position_valid = False
+            self.kb.set_command('none none none')
+            return -1
         if minimap_result is None:
             if time.time() - self.t_last_minimap_update > 30:
                 # Unable to get minimap for 30 seconds -> assume it's login screen
@@ -4867,6 +5417,19 @@ class MapleStoryAutoBot:
 
         # Get player location on global map
         self.loc_player_global = self.get_player_location_on_global_map()
+        if self.graph_navigator is not None:
+            self.graph_position_valid = bool(loc_player_minimap) and float(self.minimap_score)<0.1
+            from src.utils.player_tracking import PlayerTracking
+            if not hasattr(self,'_player_tracking'):self._player_tracking=PlayerTracking()
+            calibration=self.graph_navigator.graph.get('hunt_calibration',{})
+            previous=self.loc_player
+            self.loc_player,self._player_reference_reliable=self._player_tracking.update(
+                self.img_frame_gray,self.loc_player_global,self.loc_player,self.nametag_hit,
+                self.graph_position_valid,calibration.get('scale'),time.monotonic())
+            if self.loc_player!=previous:
+                width=self.img_nametag_gray.shape[1]
+                self.loc_nametag=(self.loc_player[0]-width//2,
+                    self.loc_player[1]+self.cfg['nametag']['offset'][1])
 
 
         #######################
@@ -4877,8 +5440,7 @@ class MapleStoryAutoBot:
             dt > self.cfg["watchdog"]["last_attack_timeout"]:
             logger.info(f"[Attack Timeout] Last attack timeout for {round(dt, 2)} seconds")
             # 换频道已移除（国服到处是人，换频道没意义）→ 超时后统一「回城并停止脚本」
-            logger.info("[Attack Timeout] Return home!")
-            press_key(self.cfg["key"]["return_home"])
+            logger.info("[Attack Timeout] Stop without issuing a return-home key.")
             self.is_terminated = True
             self.kb.is_terminated = True
 
@@ -4955,18 +5517,98 @@ class MapleStoryAutoBot:
         #####################
         ### Debug Windows ###
         #####################
+        self._latency_ms=max(0.,(time.monotonic()-self._frame_source_time)*1000)
+        self._latency_peak_ms=max(getattr(self,'_latency_peak_ms',0.),self._latency_ms)
+        if self.graph_navigator is not None and time.monotonic()-getattr(self,'_map_debug_time',0)>=.2:
+            import copy
+            self._map_debug_time=time.monotonic();nav=self.graph_navigator
+            reason=(nav.status,self.cmd_move_x,self.cmd_move_y,self.cmd_action)
+            if reason!=getattr(self,'_map_debug_reason',None):
+                self._map_debug_reason=reason;self._map_debug_reason_since=self._map_debug_time
+            target=None
+            if nav.transit:target=list(nav.transit['end'])
+            elif nav.path:target=list(nav.edges[nav.path[0]]['start'])
+            elif nav.hunt_target:target=[nav.hunt_target['x'],nav.hunt_target['y']]
+            self._map_debug_snapshot=dict(time=self._map_debug_time,map=self.cfg['bot']['map'],
+                latency_ms=self._latency_ms,latency_peak_ms=self._latency_peak_ms,
+                detection_ms=getattr(self,'_visible_scan_ms',None),
+                detection_peak_ms=getattr(self,'_visible_scan_peak_ms',None),
+                detection_source=getattr(self,'_visible_source_time',None),
+                platform_mobs=nav.platform_sweep.live_counts(self._map_debug_time) if getattr(nav,'platform_sweep',None) else {},
+                hotspots=nav.platform_sweep.top_hotspots(self._map_debug_time) if getattr(nav,'platform_sweep',None) else [],
+                sweep_done=sorted(nav.platform_sweep.done) if getattr(nav,'platform_sweep',None) else [],
+                exploration=(f'{nav.platform_sweep.exploration_reason if nav.platform_sweep.explore_target else "区域最长 90 秒未到访时强制探索"}' if getattr(nav,'platform_sweep',None) else ''),
+                priority_target=nav.platform_sweep.target if getattr(nav,'platform_sweep',None) else None,
+                survey_status=getattr(self,'_survey_status','等待首次扫描'),
+                survey_time=nav.platform_sweep.survey_time if getattr(nav,'platform_sweep',None) else None,
+                survey_due=max(0,10-(self._map_debug_time-getattr(getattr(self,'_mob_memory',None),'last_survey',-100))),
+                graph=copy.deepcopy(nav.graph),position=tuple(map(float,self.loc_player_global)),
+                valid=bool(self.graph_position_valid),platform=nav.locate(self.loc_player_global),
+                target=target,status=(f'第 {nav.platform_sweep.round} 轮，已扫 {len(nav.platform_sweep.done)}/{len(nav.platforms)} 平台；' if getattr(nav,'platform_sweep',None) else '')+nav.status,path=list(nav.path),
+                reason_seconds=self._map_debug_time-getattr(self,'_map_debug_reason_since',self._map_debug_time),
+                fault=nav.fault,transit=nav.transit['id'] if nav.transit else None,
+                command=[self.cmd_move_x,self.cmd_move_y,self.cmd_action])
+        trace=getattr(self,'_detection_trace',None)
+        if trace is not None:
+            now=time.monotonic()
+            usable=MapleStoryAutoBot.current_visible_monsters(self,now)
+            age=now-getattr(self,'_visible_source_time',-100)
+            anchor=getattr(self,'_visible_anchor',None)
+            reason=('no_result' if anchor is None else 'expired' if age>.9 else
+                    'player_reference_invalid' if not anchor[2] else
+                    'camera_shift_without_calibration' if getattr(self,'visible_monsters',[]) and not usable else
+                    'no_template_match' if not getattr(self,'visible_monsters',[]) else 'usable')
+            nav=getattr(self,'graph_navigator',None)
+            trace.record('decision',self.img_frame,dict(source_monotonic=getattr(self,'_frame_source_time',None),
+                detection_source=getattr(self,'_visible_source_time',None),result_age=age,reason=reason,
+                player=self.loc_player,global_position=self.loc_player_global,name_hit=self.nametag_hit,
+                map_valid=self.graph_position_valid,usable=usable,
+                attack_range=[self.get_attack_range(is_left=True),self.get_attack_range(is_left=False)],
+                overlap_count=sum(self.monster_overlaps_attack(m) for m in usable),
+                navigation=nav.status if nav else '',command=[self.cmd_move_x,self.cmd_move_y,self.cmd_action],
+                writer_error=trace.error))
         # Don't show debug window to save system resource
         if not self.is_show_debug_window:
             return 0 # frame done
 
+        self._viz_ready=False
+        if time.monotonic()-getattr(self,'_last_viz_render',0)<.125 and not self.video_writer:return 0
+        self._last_viz_render=time.monotonic();self._viz_ready=True
         # Print text on debug image
         _perf_t0 = time.perf_counter()
+        if getattr(self,'_visible_source_time',None) != self._frame_source_time:
+            self.refresh_visible_monsters(time.monotonic())
         self.update_info_on_img_frame_debug()
+        self.draw_visible_monsters()
         self._perf("viz画图", _perf_t0)
 
+        # Optional single-frame local diagnostics for live troubleshooting.
+        if self.cfg.get('diagnostics',{}).get('live_snapshot',False) and time.monotonic()-getattr(self,'_snapshot_time',0)>1:
+            self._snapshot_time=time.monotonic()
+            from pathlib import Path
+            import json
+            folder=Path(resource_path('debug'));folder.mkdir(exist_ok=True)
+            cv2.imencode('.png',self.img_frame_debug)[1].tofile(str(folder/'live_detection.png'))
+            cv2.imencode('.png',self.img_frame)[1].tofile(str(folder/'live_frame.png'))
+            nav=self.graph_navigator
+            (folder/'live_state.json').write_text(json.dumps(dict(player=list(map(float,self.loc_player)),
+                global_pos=list(map(float,self.loc_player_global)),name_hit=bool(self.nametag_hit),
+                name_score=float(getattr(self,'nametag_score',0)),monsters=len(self.monsters),
+                navigation=nav.status if nav else '',command=[self.cmd_move_x,self.cmd_move_y,self.cmd_action]),ensure_ascii=False),encoding='utf-8')
+
         # Save debug window to video
-        if self.video_writer:
-            self.video_writer.write(self.img_frame_debug)
+        with self._video_lock:
+            if self.video_writer:
+                self.video_writer.write(self.img_frame_debug)
+                from src.utils.input_evidence import auto_event
+                auto_event('video_frame', video_index=self._video_frame_index,
+                           monotonic_ns=int((getattr(self, '_frame_source_time', None) or time.monotonic())*1e9),
+                           recorded_monotonic_ns=time.monotonic_ns(),
+                           source_monotonic=getattr(self, '_frame_source_time', None),
+                           player_screen=getattr(self, 'loc_player', None),
+                           player_minimap=getattr(self, 'loc_player_minimap', None),
+                           focused=self.kb.is_game_window_active())
+                self._video_frame_index += 1
 
         # Resize img_route_debug for better visualization
         # ⚠️ 必须判空：这张图还没录路线时 img_route_debug 是 None，
@@ -5095,7 +5737,7 @@ class MapleStoryAutoBot:
             if ret == 0:
                 _perf_t0 = time.perf_counter()
                 # Draw image on debug window
-                if self.is_show_debug_window and self.is_ui:
+                if self.is_show_debug_window and self.is_ui and getattr(self,'_viz_ready',True):
                     # ⚠️ 必须判空（2026-09-12）：没有路线图时（这张图还没录路线）
                     #    img_route_debug 是 None，原来直接 .copy() 会 AttributeError，
                     #    而 viz 一崩主循环就跟着崩 —— 「打开游戏画面页签反而把挂机搞停」。
@@ -5115,6 +5757,12 @@ class MapleStoryAutoBot:
             target_duration = 1.0 / self.cfg["system"]["fps_limit_main"]
             if frame_duration < target_duration:
                 time.sleep(target_duration - frame_duration)
+
+        if self.video_writer is not None:
+            output_thread=getattr(self.kb,'thread_output',None)
+            if output_thread is not None:
+                output_thread.join(timeout=2)
+            self.stop_record()
 
 def main(args):
     '''

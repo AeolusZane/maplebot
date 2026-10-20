@@ -10,6 +10,7 @@ Interception 驱动输入适配器（内核级键盘/鼠标模拟）
 '''
 import time
 import random
+from src.utils.input_evidence import backend_call
 
 from src.utils.logger import logger
 
@@ -173,7 +174,7 @@ def normalize_key(key):
 def key_down(key):
     """按下按键不释放"""
     try:
-        interception.key_down(normalize_key(key))
+        backend_call('key_down', normalize_key(key), lambda: interception.key_down(normalize_key(key)))
     except Exception as e:
         _report_key_failure("key_down", key, e)
 
@@ -181,7 +182,7 @@ def key_down(key):
 def key_up(key):
     """释放按键"""
     try:
-        interception.key_up(normalize_key(key))
+        backend_call('key_up', normalize_key(key), lambda: interception.key_up(normalize_key(key)))
     except Exception as e:
         _report_key_failure("key_up", key, e)
 
@@ -199,9 +200,9 @@ def press_key(key, duration=None):
 
     try:
         _k = normalize_key(key)
-        interception.key_down(_k)
+        backend_call('key_down', _k, lambda: interception.key_down(_k))
         time.sleep(duration)
-        interception.key_up(_k)
+        backend_call('key_up', _k, lambda: interception.key_up(_k))
     except Exception as e:
         _report_key_failure("press_key", key, e)
 

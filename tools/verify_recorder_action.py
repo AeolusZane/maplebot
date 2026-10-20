@@ -307,6 +307,33 @@ check("③ 不传 --cfg 时不能落到 config_custom.yaml（方案必须生效�
       _legacy_blocked, False)
 print(f"     当前环境中 active_config_path() = {_ap}")
 
+print("\n【瞬移】配置键与 Alt 监听回归")
+rt = new_recorder("z")
+rt.cfg["key"]["teleport"] = "  ALT  "
+for direction, expected in [("left", "left none teleport"),
+                            ("right", "right none teleport"),
+                            ("up", "none up teleport"),
+                            ("down", "none down teleport")]:
+    check(f"Alt+{direction}", rt.action_from_keys(["alt", direction]), (expected, True))
+check("配置 Alt 后 E 不触发瞬移", rt.action_from_keys(["e", "right"]), ("right none none", False))
+rt.cfg["key"]["teleport"] = ""
+check("空配置关闭瞬移", rt.action_from_keys(["alt", "right"]), ("right none none", False))
+rt.cfg["key"]["teleport"] = "e"
+check("默认 E 兼容", rt.action_from_keys(["e", "up"]), ("none up teleport", True))
+
+from src.input.KeyBoardListener import KeyBoardListener
+from pynput import keyboard
+from unittest.mock import patch
+rt.cfg["key"]["teleport"] = "alt"
+with patch("src.input.KeyBoardListener.threading.Thread"), patch("src.input.KeyBoardListener.keyboard.Listener"):
+    listener = KeyBoardListener(cfg=rt.cfg, is_autobot=False)
+for alt_key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
+    listener.on_press(alt_key)
+    check(f"{alt_key} 按下", listener.key_pressing, ["alt"])
+    check(f"{alt_key} 触发配置动作", rt.action_from_keys(listener.key_pressing + ["left"]), ("left none teleport", True))
+    listener.on_release(alt_key)
+    check(f"{alt_key} 释放", listener.key_pressing, [])
+
 print("\n" + "=" * 68)
 if FAIL:
     print(f"❌ 自检失败 {len(FAIL)} 项：")

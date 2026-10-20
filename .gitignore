@@ -60,3 +60,7 @@ minimaps/*
 monster/*
 !monster/.gitkeep
 
+# Local manual sessions and curated training data
+sessions/
+datasets/
+

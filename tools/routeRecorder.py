@@ -996,7 +996,8 @@ class RouteRecorder():
             # 边跳边按上（爬管子/绳子常见）：色码表里没有"上+跳"的组合，
             # 退成「原地跳」—— 跳起来后下一帧的 up 像素会接手往上爬。
             return "none none jump", True
-        if "e" in kp:                                        # Teleport skill
+        teleport_key = str((self.cfg or {}).get("key", {}).get("teleport") or "").strip().lower()
+        if teleport_key and teleport_key in kp:
             if "left" in kp:
                 return "left none teleport", True
             if "right" in kp:

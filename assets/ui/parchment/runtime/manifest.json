@@ -1,0 +1,98 @@
+{
+  "maple": {
+    "source_bytes": 2287580,
+    "runtime_bytes": 16980,
+    "width": 96,
+    "height": 96,
+    "decoded_bytes": 36864,
+    "source_decoded_bytes": 6290064
+  },
+  "maple-muted": {
+    "source_bytes": 1819473,
+    "runtime_bytes": 12580,
+    "width": 96,
+    "height": 96,
+    "decoded_bytes": 36864,
+    "source_decoded_bytes": 6290064
+  },
+  "target": {
+    "source_bytes": 1199289,
+    "runtime_bytes": 9850,
+    "width": 96,
+    "height": 96,
+    "decoded_bytes": 36864,
+    "source_decoded_bytes": 6290064
+  },
+  "hp": {
+    "source_bytes": 1102366,
+    "runtime_bytes": 9479,
+    "width": 96,
+    "height": 96,
+    "decoded_bytes": 36864,
+    "source_decoded_bytes": 6290064
+  },
+  "mp": {
+    "source_bytes": 1257120,
+    "runtime_bytes": 10045,
+    "width": 96,
+    "height": 96,
+    "decoded_bytes": 36864,
+    "source_decoded_bytes": 6290064
+  },
+  "swords": {
+    "source_bytes": 1345372,
+    "runtime_bytes": 11385,
+    "width": 96,
+    "height": 96,
+    "decoded_bytes": 36864,
+    "source_decoded_bytes": 6290064
+  },
+  "avatar": {
+    "source_bytes": 2993104,
+    "runtime_bytes": 80154,
+    "width": 192,
+    "height": 192,
+    "decoded_bytes": 147456,
+    "source_decoded_bytes": 6290064
+  },
+  "paper-v2": {
+    "source_bytes": 2299080,
+    "runtime_bytes": 497495,
+    "width": 627,
+    "height": 627,
+    "decoded_bytes": 1572516,
+    "source_decoded_bytes": 6290064
+  },
+  "panel": {
+    "source_bytes": 2708805,
+    "runtime_bytes": 611651,
+    "width": 627,
+    "height": 627,
+    "decoded_bytes": 1572516,
+    "source_decoded_bytes": 6290064
+  },
+  "selected": {
+    "source_bytes": 3865802,
+    "runtime_bytes": 834704,
+    "width": 627,
+    "height": 627,
+    "decoded_bytes": 1572516,
+    "source_decoded_bytes": 6290064
+  },
+  "button-v2": {
+    "source_bytes": 2441114,
+    "runtime_bytes": 582377,
+    "width": 627,
+    "height": 627,
+    "decoded_bytes": 1572516,
+    "source_decoded_bytes": 6290064
+  },
+  "frame-v2": {
+    "source_bytes": 1365906,
+    "runtime_bytes": 342107,
+    "width": 627,
+    "height": 627,
+    "decoded_bytes": 1572516,
+    "source_decoded_bytes": 6290064
+  }
+}

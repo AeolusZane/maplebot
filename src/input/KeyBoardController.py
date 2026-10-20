@@ -136,6 +136,8 @@ class KeyBoardController():
     def __init__(self, cfg):
         self.cfg = cfg
         self.cmd_action = "none"
+        self.n_attack_sent=0
+        self._last_attack_press=0.0
         self.cmd_up_down = "none"
         self.cmd_left_right = "none"
         self.cmd_up_down_last = ""
@@ -208,7 +210,8 @@ class KeyBoardController():
             raise ValueError(f"Unexpected attack type: {cfg['bot']['attack']}")
 
         # Start keyboard control thread
-        threading.Thread(target=self.run, daemon=True).start()
+        self.thread_output = threading.Thread(target=self.run, daemon=True)
+        self.thread_output.start()
 
         logger.info("[KeyBoardController] Init done")
 
@@ -238,7 +241,34 @@ class KeyBoardController():
         '''
         Set keyboard command
         '''
+        from src.utils.input_evidence import auto_event, auto_active
+        command_stamp=time.monotonic()
+        if auto_active():
+            auto_event('decision_command', command=new_command,
+                       command_stamp=command_stamp,
+                       focused=self.is_game_window_active(),
+                       enabled=self.is_enable,
+                       source='controller.set_command',
+                       note='Requested command; not proof of execution')
+        previous=getattr(self,'cmd_action',None)
         self.cmd_left_right, self.cmd_up_down, self.cmd_action = new_command.split()
+        if self.cfg.get('bot', {}).get('navigation') == 'map_graph' and self.cmd_action == 'teleport' and previous!='teleport':
+            self._graph_teleport_token = object()
+        if self.cfg.get('bot', {}).get('navigation') == 'map_graph' and self.cmd_action == 'jump':
+            self._graph_jump_token = object()
+        self._pending_command=(self.cmd_left_right,self.cmd_up_down,self.cmd_action,command_stamp)
+
+    def apply_directions(self, left_right, up_down):
+        # Record exactly what was sent, never a command changed by another thread.
+        for command,negative,positive in ((left_right,'left','right'),(up_down,'up','down')):
+            if command==negative:
+                key_up(positive);self._kd(negative)
+            elif command==positive:
+                key_up(negative);self._kd(positive)
+            else:
+                key_up(negative);key_up(positive)
+        self.cmd_left_right_last=left_right
+        self.cmd_up_down_last=up_down
 
     def is_game_window_active(self):
         '''
@@ -439,6 +469,8 @@ class KeyBoardController():
         run
         '''
         while not self.is_terminated:
+            from src.utils.input_evidence import action_context, auto_event
+            action_context()
             if not self.is_enable:
                 self.limit_fps()
                 continue
@@ -492,49 +524,19 @@ class KeyBoardController():
             ##########################
             ### Left-Right Command ###
             ##########################
-            if self.cmd_left_right == "left":
-                key_up("right")
-                self._kd("left")
-            elif self.cmd_left_right == "right":
-                key_up("left")
-                self._kd("right")
-            elif self.cmd_left_right == "stop":
-                key_up("left")
-                key_up("right")
-            elif self.cmd_left_right == "none":
-                if self.cmd_left_right_last != "none":
-                    key_up("left")
-                    key_up("right")
-            else:
-                logger.error("[KeyBoardController] Unsupported left-right command: "
-                             f"{self.cmd_left_right}")
-            self.cmd_left_right_last = self.cmd_left_right
-
-            #######################
-            ### Up-Down Command ###
-            #######################
-            if self.cmd_up_down == "up":
-                key_up("down")
-                self._kd("up")
-            elif self.cmd_up_down == "down":
-                key_up("up")
-                self._kd("down")
-            elif self.cmd_up_down == "stop":
-                key_up("up")
-                key_up("down")
-            elif self.cmd_up_down == "none":
-                if self.cmd_up_down_last != "none":
-                    key_up("up")
-                    key_up("down")
-            else:
-                logger.error("[KeyBoardController] Unsupported up-down command: "
-                             f"{self.cmd_up_down}")
-            self.cmd_up_down_last = self.cmd_up_down
+            lr,ud,action,updated=getattr(self,'_pending_command',('none','none','none',0))
+            if time.monotonic()-updated>0.75:
+                lr=ud=action='none'
+            auto_event('command_consumed', command_stamp=updated,
+                       selected_command=[lr,ud,action],
+                       stale=time.monotonic()-updated>0.75)
+            action_context(updated)
+            self.apply_directions(lr,ud)
 
             ######################
             ### Action Command ###
             ######################
-            if self.cmd_action == "jump":
+            if action == "jump":
                 # ── 跳跃冷却（2026-09-13 用户实测必修）────────────────────────
                 # 角色只要站在一片 jump 像素上，本线程就是**每帧**走到这里按一次跳。
                 # 30fps 下 = 每秒按 30 次 = 连跳，表现是「跳上平台了还在跳，
@@ -551,7 +553,10 @@ class KeyBoardController():
                     _jump_cd = DEFAULT_JUMP_COOLDOWN
                 # "该不该发"这个判断已抽成模块级纯函数 jump_ready（离线可测，
                 # 见 tools/verify_jump_cooldown.py）—— 这里只负责读配置 + 发键。
-                if jump_ready(self.t_last_jump, cooldown=_jump_cd):
+                _graph_jump = self.cfg.get('bot', {}).get('navigation') == 'map_graph'
+                _jump_token = getattr(self, '_graph_jump_token', None)
+                _new_jump = not _graph_jump or (_jump_token is not None and _jump_token is not getattr(self, '_graph_jump_consumed', None))
+                if _new_jump and jump_ready(self.t_last_jump, cooldown=_jump_cd):
                     # ⚠️ `self.t_last_jump = time.time()` 这行**必须保持原样写法**：
                     #    tools/verify_jump_cooldown.py 用 inspect.getsource 反向钉住了它
                     #    （防有人把更新删掉 → 冷却永远不生效 → 连跳复发）。
@@ -559,6 +564,7 @@ class KeyBoardController():
                     _prev_jump = self.t_last_jump
                     self._press(self.cfg["key"]["jump"])
                     self.t_last_jump = time.time()
+                    if _graph_jump:self._graph_jump_consumed = _jump_token
                     _dt = self.t_last_jump - _prev_jump
                     # ── 埋点①：真的按下去了（区分 B / C 的关键一行）───────
                     self.n_jump_sent += 1
@@ -581,14 +587,24 @@ class KeyBoardController():
                         self._t_last_block_log = _t
                         if _msg:
                             logger.info(_msg)
-            elif self.cmd_action == "teleport":
-                self._press(self.cfg["key"]["teleport"])
-            elif self.cmd_action == "attack":
-                self._press(self.attack_key)
-                self.t_last_skill = time.time()
-            elif self.cmd_action == "goal":
+            elif action == "teleport":
+                # A graph transfer is one proposal. Multiple keyboard-loop ticks
+                # within one observation must not fire multiple teleports.
+                token = getattr(self, '_graph_teleport_token', None)
+                if self.cfg.get('bot', {}).get('navigation') != 'map_graph' or (token is not None and token is not getattr(self, '_graph_teleport_consumed', None)):
+                    self._press(self.cfg["key"]["teleport"])
+                    self._graph_teleport_consumed = token
+            elif action == "attack":
+                skill=self.cfg['aoe_skill' if self.cfg['bot']['attack']=='aoe_skill' else 'directional_attack']
+                interval=max(0.0,float(skill.get('cooldown',0)))
+                if time.monotonic()-self._last_attack_press>=interval:
+                    self._press(self.attack_key)
+                    self.n_attack_sent+=1
+                    self._last_attack_press=time.monotonic()
+                    self.t_last_skill = time.time()
+            elif action == "goal":
                 pass
-            elif self.cmd_action == "none":
+            elif action == "none":
                 pass
             else:
                 logger.error("[KeyBoardController] Unsupported action command: "
